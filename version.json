@@ -1,0 +1,5 @@
+{
+  "version": "1.2.0",
+  "changelog": "Kiro-Go Plus adds regional Kiro endpoints, original account JSON import, and automatic profile resolution.\nKiro-Go Plus 新增区域化 Kiro 接口、原始账号 JSON 导入与 Profile 自动解析。",
+  "download": "https://github.com/alphanb002/kiro-go-plus"
+}
