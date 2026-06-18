@@ -189,6 +189,103 @@ func TestDecodeCredentialImportRequestAcceptsOriginalExportArray(t *testing.T) {
 	}
 }
 
+func TestDecodeCredentialImportRequestAcceptsExternalIdpExport(t *testing.T) {
+	body := `[{"email":"user@corp.com","refreshToken":"rt","provider":"ExternalIdp","authMethod":"external_idp","tokenEndpoint":"https://login.microsoftonline.com/tenant/oauth2/v2.0/token","clientId":"abc","scopes":"api://abc/codewhisperer:conversations offline_access"}]`
+
+	got, err := decodeCredentialImportRequest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("decodeCredentialImportRequest: %v", err)
+	}
+	if got.Email != "user@corp.com" || got.RefreshToken != "rt" || got.ClientID != "abc" {
+		t.Fatalf("basic fields not mapped: %+v", got)
+	}
+	if got.AuthMethod != "external_idp" || got.Provider != "ExternalIdp" {
+		t.Fatalf("authMethod/provider not mapped: %+v", got)
+	}
+	if got.TokenEndpoint != "https://login.microsoftonline.com/tenant/oauth2/v2.0/token" {
+		t.Fatalf("tokenEndpoint = %q", got.TokenEndpoint)
+	}
+	if got.Scopes != "api://abc/codewhisperer:conversations offline_access" {
+		t.Fatalf("scopes = %q", got.Scopes)
+	}
+}
+
+func TestDecodeCredentialImportRequestAcceptsScopesArray(t *testing.T) {
+	body := `{"refreshToken":"rt","tokenEndpoint":"https://idp/token","clientId":"abc","scopes":["s1","s2","offline_access"]}`
+	got, err := decodeCredentialImportRequest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("decodeCredentialImportRequest: %v", err)
+	}
+	if got.Scopes != "s1 s2 offline_access" {
+		t.Fatalf("scopes array not joined: %q", got.Scopes)
+	}
+}
+
+// TestApiImportCredentialsExternalIdp exercises the full Kiro Account Manager
+// external-IdP export: the handler must refresh against the IdP token endpoint
+// (form-encoded), keep authMethod as external_idp, and fall back to the export's
+// email when getUserInfo yields nothing.
+func TestApiImportCredentialsExternalIdp(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	var refreshHit bool
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshHit = true
+		if ct := r.Header.Get("Content-Type"); ct != "application/x-www-form-urlencoded" {
+			t.Errorf("unexpected content type: %q", ct)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"token_type":"Bearer","access_token":"entra-at","refresh_token":"entra-rt","expires_in":3600}`)
+	}))
+	defer idp.Close()
+
+	h := &Handler{pool: accountpool.GetPool()}
+	// profileArn is supplied to keep the test hermetic: without it the handler
+	// would call listAvailableProfiles over the real network, which both flakes
+	// and poisons http.ProxyFromEnvironment for sibling transport tests.
+	body := fmt.Sprintf(
+		`[{"email":"user@corp.com","refreshToken":"rt","provider":"ExternalIdp","authMethod":"external_idp","tokenEndpoint":%q,"clientId":"abc","scopes":"api://abc/codewhisperer:conversations offline_access","profileArn":"arn:aws:codewhisperer:us-east-1:123:profile/X"}]`,
+		idp.URL,
+	)
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !refreshHit {
+		t.Fatal("external IdP token endpoint was never called")
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected one account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "external_idp" {
+		t.Fatalf("authMethod = %q, want external_idp", got.AuthMethod)
+	}
+	if got.Provider != "ExternalIdp" {
+		t.Fatalf("provider = %q", got.Provider)
+	}
+	if got.AccessToken != "entra-at" || got.RefreshToken != "entra-rt" {
+		t.Fatalf("tokens not persisted from IdP refresh: %+v", got)
+	}
+	if got.TokenEndpoint != idp.URL || got.Scopes == "" {
+		t.Fatalf("refresh params not persisted: endpoint=%q scopes=%q", got.TokenEndpoint, got.Scopes)
+	}
+	// getUserInfo will fail against the fake endpoint, so the email must come
+	// from the export payload.
+	if got.Email != "user@corp.com" {
+		t.Fatalf("email = %q, want fallback to export email", got.Email)
+	}
+}
+
 func TestDecodeCredentialImportRequestRejectsMultiAccountArray(t *testing.T) {
 	_, err := decodeCredentialImportRequest(strings.NewReader(`[{"refresh_token":"one"},{"refresh_token":"two"}]`))
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {

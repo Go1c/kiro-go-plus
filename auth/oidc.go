@@ -7,6 +7,7 @@ import (
 	"io"
 	"kiro-go-plus/config"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -31,10 +32,68 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	}
 	client := GetAuthClientForProxy(proxyURL)
 
+	if account.AuthMethod == "external_idp" {
+		return refreshExternalIdpToken(account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
+	}
 	if account.AuthMethod == "social" {
 		return refreshSocialToken(account.RefreshToken, client)
 	}
 	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+}
+
+// refreshExternalIdpToken refreshes the access token of an enterprise external
+// IdP account (e.g. Microsoft Entra / Azure AD) exported by Kiro Account Manager.
+// Unlike the AWS OIDC endpoints, the external IdP uses a standard OAuth2
+// form-encoded refresh_token grant against its own token endpoint, and the
+// returned snake_case access_token is used directly as the CodeWhisperer bearer.
+func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
+	tokenEndpoint = strings.TrimSpace(tokenEndpoint)
+	if tokenEndpoint == "" {
+		return "", "", 0, "", fmt.Errorf("external IdP refresh requires tokenEndpoint")
+	}
+	if clientID == "" {
+		return "", "", 0, "", fmt.Errorf("external IdP refresh requires clientId")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("client_id", clientID)
+	form.Set("refresh_token", refreshToken)
+	if scopes = strings.TrimSpace(scopes); scopes != "" {
+		form.Set("scope", scopes)
+	}
+
+	req, _ := http.NewRequest("POST", tokenEndpoint, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", 0, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", "", 0, "", fmt.Errorf("refresh failed: %d %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", 0, "", err
+	}
+	if result.AccessToken == "" {
+		return "", "", 0, "", fmt.Errorf("external IdP refresh returned no access_token")
+	}
+
+	expiresAt := time.Now().Unix() + int64(result.ExpiresIn)
+	// External IdP accounts have no profileArn from the refresh; it is resolved
+	// separately via listAvailableProfiles after a successful refresh.
+	return result.AccessToken, result.RefreshToken, expiresAt, "", nil
 }
 
 // refreshOIDCToken IdC/Builder ID token 刷新

@@ -769,6 +769,7 @@
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
+    if (normalized === 'external_idp' || normalized === 'externalidp') return t('auth.externalIdp');
     return method;
   }
   function getStatusBadge(a) {
@@ -2161,6 +2162,7 @@
         items = json.accounts.map(a => {
           const c = a.credentials || {};
           return {
+            email: c.email || a.email,
             refreshToken: c.refreshToken || c.refresh_token || a.refreshToken || a.refresh_token,
             accessToken: c.accessToken || c.access_token || a.accessToken || a.access_token,
             clientId: c.clientId || c.client_id || a.clientId || a.client_id,
@@ -2168,7 +2170,9 @@
             region: c.region || a.region,
             authMethod: c.authMethod || c.auth_method || a.authMethod || a.auth_method,
             provider: c.provider || a.provider || a.idp,
-            profileArn: c.profileArn || c.profile_arn || a.profileArn || a.profile_arn
+            profileArn: c.profileArn || c.profile_arn || a.profileArn || a.profile_arn,
+            tokenEndpoint: c.tokenEndpoint || c.token_endpoint || a.tokenEndpoint || a.token_endpoint,
+            scopes: c.scopes || c.scope || a.scopes || a.scope
           };
         });
       } else {
@@ -2196,24 +2200,40 @@
         clientId: rawItem.clientId || rawItem.client_id,
         clientSecret: rawItem.clientSecret || rawItem.client_secret,
         authMethod: rawItem.authMethod || rawItem.auth_method,
-        profileArn: rawItem.profileArn || rawItem.profile_arn
+        profileArn: rawItem.profileArn || rawItem.profile_arn,
+        tokenEndpoint: rawItem.tokenEndpoint || rawItem.token_endpoint,
+        scopes: rawItem.scopes || rawItem.scope
       };
       if (!item.refreshToken) { fail++; continue; }
-      let authMethod = item.authMethod || '';
-      if (item.clientId && item.clientSecret) authMethod = 'idc';
-      else if (!authMethod || authMethod === 'social') authMethod = 'social';
-      else authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
+      const rawMethod = (item.authMethod || '').toLowerCase();
+      // Enterprise external IdP export (Kiro Account Manager): a token endpoint
+      // signals an OAuth2 refresh against the IdP, not the AWS social/idc flow.
+      const isExternalIdp = rawMethod === 'external_idp' || rawMethod === 'externalidp' ||
+        (!!item.tokenEndpoint && !item.clientSecret);
+      let authMethod;
       let provider = item.provider || '';
-      if (!provider && authMethod === 'social') provider = 'Google';
-      if (!provider && authMethod === 'idc') provider = 'BuilderId';
+      if (isExternalIdp) {
+        authMethod = 'external_idp';
+        if (!provider) provider = 'ExternalIdp';
+      } else {
+        if (item.clientId && item.clientSecret) authMethod = 'idc';
+        else if (!rawMethod || rawMethod === 'social') authMethod = 'social';
+        else authMethod = rawMethod === 'idc' ? 'idc' : 'social';
+        if (!provider && authMethod === 'social') provider = 'Google';
+        if (!provider && authMethod === 'idc') provider = 'BuilderId';
+      }
+      const scopes = Array.isArray(item.scopes) ? item.scopes.join(' ') : (item.scopes || '');
       const payload = {
+        email: item.email || '',
         refreshToken: item.refreshToken,
         accessToken: item.accessToken || '',
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
         authMethod, provider,
         region: item.region || 'us-east-1',
-        profileArn: item.profileArn || ''
+        profileArn: item.profileArn || '',
+        tokenEndpoint: item.tokenEndpoint || '',
+        scopes
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });

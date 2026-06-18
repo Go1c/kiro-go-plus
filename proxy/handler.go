@@ -41,14 +41,17 @@ type Handler struct {
 }
 
 type credentialImportRequest struct {
-	AccessToken  string
-	RefreshToken string
-	ClientID     string
-	ClientSecret string
-	AuthMethod   string
-	Provider     string
-	Region       string
-	ProfileArn   string
+	Email         string
+	AccessToken   string
+	RefreshToken  string
+	ClientID      string
+	ClientSecret  string
+	AuthMethod    string
+	Provider      string
+	Region        string
+	ProfileArn    string
+	TokenEndpoint string
+	Scopes        string
 }
 
 func decodeCredentialImportRequest(r io.Reader) (credentialImportRequest, error) {
@@ -88,15 +91,38 @@ func decodeCredentialImportRequest(r io.Reader) (credentialImportRequest, error)
 		return ""
 	}
 
+	// readScopes accepts either a space-separated string or a JSON array of
+	// strings and normalizes to a single space-separated string.
+	readScopes := func(keys ...string) string {
+		for _, key := range keys {
+			value, ok := values[key]
+			if !ok {
+				continue
+			}
+			var asString string
+			if json.Unmarshal(value, &asString) == nil {
+				return asString
+			}
+			var asArray []string
+			if json.Unmarshal(value, &asArray) == nil {
+				return strings.Join(asArray, " ")
+			}
+		}
+		return ""
+	}
+
 	return credentialImportRequest{
-		AccessToken:  readString("accessToken", "access_token"),
-		RefreshToken: readString("refreshToken", "refresh_token"),
-		ClientID:     readString("clientId", "client_id"),
-		ClientSecret: readString("clientSecret", "client_secret"),
-		AuthMethod:   readString("authMethod", "auth_method"),
-		Provider:     readString("provider"),
-		Region:       readString("region"),
-		ProfileArn:   readString("profileArn", "profile_arn"),
+		Email:         readString("email"),
+		AccessToken:   readString("accessToken", "access_token"),
+		RefreshToken:  readString("refreshToken", "refresh_token"),
+		ClientID:      readString("clientId", "client_id"),
+		ClientSecret:  readString("clientSecret", "client_secret"),
+		AuthMethod:    readString("authMethod", "auth_method"),
+		Provider:      readString("provider"),
+		Region:        readString("region"),
+		ProfileArn:    readString("profileArn", "profile_arn"),
+		TokenEndpoint: readString("tokenEndpoint", "token_endpoint"),
+		Scopes:        readScopes("scopes", "scope"),
 	}, nil
 }
 
@@ -2866,11 +2892,28 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		req.AuthMethod = "idc"
 	case "social", "google", "github":
 		req.AuthMethod = "social"
+	case "external_idp", "externalidp", "external":
+		req.AuthMethod = "external_idp"
 	default:
-		if req.ClientID != "" && req.ClientSecret != "" {
+		if req.TokenEndpoint != "" {
+			// Enterprise SSO export (Kiro Account Manager): a token endpoint but
+			// no client secret indicates an external IdP refresh flow.
+			req.AuthMethod = "external_idp"
+		} else if req.ClientID != "" && req.ClientSecret != "" {
 			req.AuthMethod = "idc"
 		} else {
 			req.AuthMethod = "social"
+		}
+	}
+
+	if req.AuthMethod == "external_idp" {
+		if req.TokenEndpoint == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "external IdP account requires tokenEndpoint"})
+			return
+		}
+		if req.Provider == "" {
+			req.Provider = "ExternalIdp"
 		}
 	}
 
@@ -2878,11 +2921,13 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
 	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		Scopes:        req.Scopes,
 	}
 	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
@@ -2894,8 +2939,12 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		req.RefreshToken = newRefreshToken
 	}
 
-	// 获取用户信息
+	// 获取用户信息。外部 IdP 账号的 getUsageLimits 不一定返回 email，
+	// 此时回退到导出文件中携带的 email。
 	email, _, _ := auth.GetUserInfo(accessToken)
+	if email == "" {
+		email = strings.TrimSpace(req.Email)
+	}
 	profileArn := strings.TrimSpace(req.ProfileArn)
 	if profileArn == "" {
 		profileArn = newProfileArn
@@ -2903,19 +2952,21 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 	// 创建账号
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   profileArn,
+		ID:            auth.GenerateAccountID(),
+		Email:         email,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Provider:      req.Provider,
+		Region:        req.Region,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		ProfileArn:    profileArn,
+		TokenEndpoint: req.TokenEndpoint,
+		Scopes:        req.Scopes,
 	}
 
 	// The common seven-field import format does not include profileArn. Resolve it
