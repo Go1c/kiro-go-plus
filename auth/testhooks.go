@@ -14,16 +14,6 @@ func SetOIDCTokenURLForTest(fn func(region string) string) {
 // can restore it after replacement.
 func GetOIDCTokenURLForTest() func(region string) string { return oidcTokenURL }
 
-// SetSocialTokenURLForTest replaces the social/external-IdP refresh URL builder.
-// Test-only. Returns the previous builder so callers can restore it.
-func SetSocialTokenURLForTest(fn func() string) func() string {
-	old := socialTokenURL
-	if fn != nil {
-		socialTokenURL = fn
-	}
-	return old
-}
-
 // SetGlobalAuthClientForTest swaps the global auth HTTP client. The package's
 // init() installs a client whose Transport calls http.ProxyFromEnvironment, and
 // that function caches env vars on first call — which corrupts later tests

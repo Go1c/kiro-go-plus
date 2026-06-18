@@ -51,6 +51,7 @@ type credentialImportRequest struct {
 	Region        string
 	ProfileArn    string
 	TokenEndpoint string
+	IssuerURL     string
 	Scopes        string
 }
 
@@ -122,6 +123,7 @@ func decodeCredentialImportRequest(r io.Reader) (credentialImportRequest, error)
 		Region:        readString("region"),
 		ProfileArn:    readString("profileArn", "profile_arn"),
 		TokenEndpoint: readString("tokenEndpoint", "token_endpoint"),
+		IssuerURL:     readString("issuerUrl", "issuer_url", "issuer"),
 		Scopes:        readScopes("scopes", "scope"),
 	}, nil
 }
@@ -2962,6 +2964,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		MachineId:     config.GenerateMachineId(),
 		ProfileArn:    profileArn,
 		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
 		Scopes:        req.Scopes,
 	}
 

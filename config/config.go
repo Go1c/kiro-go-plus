@@ -48,13 +48,13 @@ type Account struct {
 	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google) or "external_idp" (enterprise SSO)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "ExternalIdp")
 
-	// External IdP (enterprise SSO, e.g. Microsoft Entra / Okta) origin metadata,
-	// preserved from the Kiro Account Manager export. These are NOT used to
-	// refresh the token — external_idp accounts refresh through Kiro's desktop
-	// auth endpoint (the social path), which brokers the IdP exchange. Kept for
-	// provenance / possible future re-auth only.
-	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // OAuth2 token endpoint of the external IdP
-	Scopes        string `json:"scopes,omitempty"`        // Space-separated OAuth2 scopes from the IdP app
+	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
+	// When AuthMethod == "external_idp" the credential is an IdP-issued OAuth token refreshed
+	// against TokenEndpoint using ClientID and Scopes (refresh_token grant), NOT the AWS SSO
+	// OIDC endpoint. IssuerURL is the OIDC issuer the endpoints were discovered from.
+	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint (refresh)
+	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
+	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
 	Region        string `json:"region"`                  // AWS region for OIDC endpoints
 	StartUrl      string `json:"startUrl,omitempty"`      // AWS SSO start URL
 	ExpiresAt     int64  `json:"expiresAt,omitempty"`     // Token expiration timestamp (Unix seconds)

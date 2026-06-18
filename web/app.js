@@ -2172,6 +2172,7 @@
             provider: c.provider || a.provider || a.idp,
             profileArn: c.profileArn || c.profile_arn || a.profileArn || a.profile_arn,
             tokenEndpoint: c.tokenEndpoint || c.token_endpoint || a.tokenEndpoint || a.token_endpoint,
+            issuerUrl: c.issuerUrl || c.issuer_url || a.issuerUrl || a.issuer_url,
             scopes: c.scopes || c.scope || a.scopes || a.scope
           };
         });
@@ -2202,14 +2203,15 @@
         authMethod: rawItem.authMethod || rawItem.auth_method,
         profileArn: rawItem.profileArn || rawItem.profile_arn,
         tokenEndpoint: rawItem.tokenEndpoint || rawItem.token_endpoint,
+        issuerUrl: rawItem.issuerUrl || rawItem.issuer_url,
         scopes: rawItem.scopes || rawItem.scope
       };
       if (!item.refreshToken) { fail++; continue; }
       const rawMethod = (item.authMethod || '').toLowerCase();
       const rawProvider = (item.provider || '').toLowerCase();
-      // Enterprise external IdP export (Kiro Account Manager). These accounts
-      // refresh through Kiro's social/desktop broker — not the IdP directly —
-      // so they behave like social accounts once imported.
+      // Enterprise external IdP export (Kiro Account Manager / Azure AD). These
+      // refresh against the IdP token endpoint (refresh_token grant), and their
+      // CodeWhisperer calls carry a TokenType: EXTERNAL_IDP header server-side.
       const isExternalIdp = rawMethod === 'external_idp' || rawMethod === 'externalidp' ||
         rawProvider === 'externalidp' || (!!item.tokenEndpoint && !item.clientSecret);
       let authMethod;
@@ -2235,6 +2237,7 @@
         region: item.region || 'us-east-1',
         profileArn: item.profileArn || '',
         tokenEndpoint: item.tokenEndpoint || '',
+        issuerUrl: item.issuerUrl || '',
         scopes
       };
       try {
