@@ -2206,10 +2206,12 @@
       };
       if (!item.refreshToken) { fail++; continue; }
       const rawMethod = (item.authMethod || '').toLowerCase();
-      // Enterprise external IdP export (Kiro Account Manager): a token endpoint
-      // signals an OAuth2 refresh against the IdP, not the AWS social/idc flow.
+      const rawProvider = (item.provider || '').toLowerCase();
+      // Enterprise external IdP export (Kiro Account Manager). These accounts
+      // refresh through Kiro's social/desktop broker — not the IdP directly —
+      // so they behave like social accounts once imported.
       const isExternalIdp = rawMethod === 'external_idp' || rawMethod === 'externalidp' ||
-        (!!item.tokenEndpoint && !item.clientSecret);
+        rawProvider === 'externalidp' || (!!item.tokenEndpoint && !item.clientSecret);
       let authMethod;
       let provider = item.provider || '';
       if (isExternalIdp) {

@@ -48,11 +48,13 @@ type Account struct {
 	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google) or "external_idp" (enterprise SSO)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "ExternalIdp")
 
-	// External IdP (enterprise SSO, e.g. Microsoft Entra / Azure AD) refresh parameters.
-	// Only used when AuthMethod == "external_idp"; the token endpoint and scopes come
-	// from the identity provider and are required to refresh the access token.
+	// External IdP (enterprise SSO, e.g. Microsoft Entra / Okta) origin metadata,
+	// preserved from the Kiro Account Manager export. These are NOT used to
+	// refresh the token — external_idp accounts refresh through Kiro's desktop
+	// auth endpoint (the social path), which brokers the IdP exchange. Kept for
+	// provenance / possible future re-auth only.
 	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // OAuth2 token endpoint of the external IdP
-	Scopes        string `json:"scopes,omitempty"`        // Space-separated OAuth2 scopes requested on refresh
+	Scopes        string `json:"scopes,omitempty"`        // Space-separated OAuth2 scopes from the IdP app
 	Region        string `json:"region"`                  // AWS region for OIDC endpoints
 	StartUrl      string `json:"startUrl,omitempty"`      // AWS SSO start URL
 	ExpiresAt     int64  `json:"expiresAt,omitempty"`     // Token expiration timestamp (Unix seconds)

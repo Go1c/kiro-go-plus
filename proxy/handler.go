@@ -2895,9 +2895,10 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	case "external_idp", "externalidp", "external":
 		req.AuthMethod = "external_idp"
 	default:
-		if req.TokenEndpoint != "" {
-			// Enterprise SSO export (Kiro Account Manager): a token endpoint but
-			// no client secret indicates an external IdP refresh flow.
+		if req.TokenEndpoint != "" || strings.EqualFold(req.Provider, "ExternalIdp") {
+			// Enterprise SSO export (Kiro Account Manager): an IdP token endpoint
+			// (or ExternalIdp provider) marks an external IdP account. It refreshes
+			// through Kiro's desktop/social broker, same as social accounts.
 			req.AuthMethod = "external_idp"
 		} else if req.ClientID != "" && req.ClientSecret != "" {
 			req.AuthMethod = "idc"
@@ -2906,15 +2907,10 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.AuthMethod == "external_idp" {
-		if req.TokenEndpoint == "" {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "external IdP account requires tokenEndpoint"})
-			return
-		}
-		if req.Provider == "" {
-			req.Provider = "ExternalIdp"
-		}
+	// external_idp refreshes via the social broker; tokenEndpoint/scopes are kept
+	// as provenance metadata only, so they are not required for import.
+	if req.AuthMethod == "external_idp" && req.Provider == "" {
+		req.Provider = "ExternalIdp"
 	}
 
 	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：

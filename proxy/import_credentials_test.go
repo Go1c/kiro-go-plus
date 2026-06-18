@@ -222,9 +222,10 @@ func TestDecodeCredentialImportRequestAcceptsScopesArray(t *testing.T) {
 }
 
 // TestApiImportCredentialsExternalIdp exercises the full Kiro Account Manager
-// external-IdP export: the handler must refresh against the IdP token endpoint
-// (form-encoded), keep authMethod as external_idp, and fall back to the export's
-// email when getUserInfo yields nothing.
+// external-IdP export: the handler must refresh through Kiro's social/desktop
+// broker (NOT the IdP's tokenEndpoint), keep authMethod as external_idp, persist
+// the brokered profileArn, and fall back to the export's email when getUserInfo
+// yields nothing.
 func TestApiImportCredentialsExternalIdp(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -233,24 +234,19 @@ func TestApiImportCredentialsExternalIdp(t *testing.T) {
 	defer installCleanAuthClient(t)()
 
 	var refreshHit bool
-	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		refreshHit = true
-		if ct := r.Header.Get("Content-Type"); ct != "application/x-www-form-urlencoded" {
-			t.Errorf("unexpected content type: %q", ct)
-		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"token_type":"Bearer","access_token":"entra-at","refresh_token":"entra-rt","expires_in":3600}`)
+		// Kiro's broker returns a CodeWhisperer-usable token + profileArn.
+		fmt.Fprint(w, `{"accessToken":"kiro-at","refreshToken":"kiro-rt","expiresIn":3600,"profileArn":"arn:aws:codewhisperer:us-east-1:123:profile/X"}`)
 	}))
-	defer idp.Close()
+	defer broker.Close()
+
+	restore := auth.SetSocialTokenURLForTest(func() string { return broker.URL + "/refreshToken" })
+	defer auth.SetSocialTokenURLForTest(restore)
 
 	h := &Handler{pool: accountpool.GetPool()}
-	// profileArn is supplied to keep the test hermetic: without it the handler
-	// would call listAvailableProfiles over the real network, which both flakes
-	// and poisons http.ProxyFromEnvironment for sibling transport tests.
-	body := fmt.Sprintf(
-		`[{"email":"user@corp.com","refreshToken":"rt","provider":"ExternalIdp","authMethod":"external_idp","tokenEndpoint":%q,"clientId":"abc","scopes":"api://abc/codewhisperer:conversations offline_access","profileArn":"arn:aws:codewhisperer:us-east-1:123:profile/X"}]`,
-		idp.URL,
-	)
+	body := `[{"email":"user@corp.com","refreshToken":"entra-rt","provider":"ExternalIdp","authMethod":"external_idp","tokenEndpoint":"https://login.microsoftonline.com/tenant/oauth2/v2.0/token","clientId":"abc","scopes":"api://abc/codewhisperer:conversations offline_access"}]`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -260,7 +256,7 @@ func TestApiImportCredentialsExternalIdp(t *testing.T) {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	if !refreshHit {
-		t.Fatal("external IdP token endpoint was never called")
+		t.Fatal("Kiro social/desktop broker was never called")
 	}
 	accs := config.GetAccounts()
 	if len(accs) != 1 {
@@ -273,11 +269,15 @@ func TestApiImportCredentialsExternalIdp(t *testing.T) {
 	if got.Provider != "ExternalIdp" {
 		t.Fatalf("provider = %q", got.Provider)
 	}
-	if got.AccessToken != "entra-at" || got.RefreshToken != "entra-rt" {
-		t.Fatalf("tokens not persisted from IdP refresh: %+v", got)
+	if got.AccessToken != "kiro-at" || got.RefreshToken != "kiro-rt" {
+		t.Fatalf("tokens not persisted from broker refresh: %+v", got)
 	}
-	if got.TokenEndpoint != idp.URL || got.Scopes == "" {
-		t.Fatalf("refresh params not persisted: endpoint=%q scopes=%q", got.TokenEndpoint, got.Scopes)
+	if got.ProfileArn != "arn:aws:codewhisperer:us-east-1:123:profile/X" {
+		t.Fatalf("brokered profileArn not persisted: %q", got.ProfileArn)
+	}
+	// Origin metadata is preserved from the export for provenance.
+	if got.TokenEndpoint == "" || got.Scopes == "" {
+		t.Fatalf("origin metadata not persisted: endpoint=%q scopes=%q", got.TokenEndpoint, got.Scopes)
 	}
 	// getUserInfo will fail against the fake endpoint, so the email must come
 	// from the export payload.

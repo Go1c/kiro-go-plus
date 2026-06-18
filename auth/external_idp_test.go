@@ -2,65 +2,65 @@ package auth
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strings"
 	"testing"
+
+	"kiro-go-plus/config"
 )
 
-func TestRefreshExternalIdpToken(t *testing.T) {
-	var gotForm url.Values
-	var gotContentType string
+// TestRefreshTokenExternalIdpUsesSocialEndpoint verifies that enterprise
+// external-IdP accounts (provider "ExternalIdp") refresh through Kiro's desktop
+// auth endpoint — the same broker as social logins — rather than calling the
+// IdP's own tokenEndpoint, whose tokens CodeWhisperer rejects with HTTP 403.
+func TestRefreshTokenExternalIdpUsesSocialEndpoint(t *testing.T) {
+	var gotPath string
+	var gotBody string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotContentType = r.Header.Get("Content-Type")
-		body, _ := io.ReadAll(r.Body)
-		gotForm, _ = url.ParseQuery(string(body))
+		gotPath = r.URL.Path
+		buf := make([]byte, r.ContentLength)
+		r.Body.Read(buf)
+		gotBody = string(buf)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"token_type":"Bearer","access_token":"entra-access","refresh_token":"entra-rotated","expires_in":3600,"id_token":"id"}`)
+		fmt.Fprint(w, `{"accessToken":"kiro-at","refreshToken":"kiro-rt","expiresIn":3600,"profileArn":"arn:aws:codewhisperer:us-east-1:1:profile/X"}`)
 	}))
 	defer server.Close()
 
-	accessToken, refreshToken, expiresAt, profileArn, err := refreshExternalIdpToken(
-		"old-refresh", "client-123", server.URL, "scope-a scope-b offline_access", server.Client(),
-	)
-	if err != nil {
-		t.Fatalf("refreshExternalIdpToken: %v", err)
+	// RefreshToken consults config.GetProxyURL(), so config must be initialized.
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
 	}
-	if accessToken != "entra-access" || refreshToken != "entra-rotated" {
+
+	// Install a clean global client (Proxy=nil) so issuing this request does not
+	// cache http.ProxyFromEnvironment and poison sibling transport-proxy tests.
+	prevClient := SetGlobalAuthClientForTest(&http.Client{Transport: &http.Transport{}})
+	defer SetGlobalAuthClientForTest(prevClient)
+
+	restore := SetSocialTokenURLForTest(func() string { return server.URL + "/refreshToken" })
+	defer SetSocialTokenURLForTest(restore)
+
+	acc := &config.Account{
+		AuthMethod:    "external_idp",
+		Provider:      "ExternalIdp",
+		RefreshToken:  "entra-rt",
+		TokenEndpoint: "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+		Scopes:        "api://abc/codewhisperer:conversations offline_access",
+	}
+	accessToken, refreshToken, _, profileArn, err := RefreshToken(acc)
+	if err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	if accessToken != "kiro-at" || refreshToken != "kiro-rt" {
 		t.Fatalf("unexpected tokens: access=%q refresh=%q", accessToken, refreshToken)
 	}
-	if expiresAt == 0 {
-		t.Fatalf("expiresAt should be set")
+	if profileArn != "arn:aws:codewhisperer:us-east-1:1:profile/X" {
+		t.Fatalf("expected brokered profileArn, got %q", profileArn)
 	}
-	if profileArn != "" {
-		t.Fatalf("external IdP refresh should not return a profileArn, got %q", profileArn)
+	if gotPath != "/refreshToken" {
+		t.Fatalf("expected social /refreshToken endpoint, got %q", gotPath)
 	}
-	if gotContentType != "application/x-www-form-urlencoded" {
-		t.Fatalf("unexpected content type: %q", gotContentType)
-	}
-	if gotForm.Get("grant_type") != "refresh_token" ||
-		gotForm.Get("client_id") != "client-123" ||
-		gotForm.Get("refresh_token") != "old-refresh" ||
-		gotForm.Get("scope") != "scope-a scope-b offline_access" {
-		t.Fatalf("unexpected form: %v", gotForm)
-	}
-}
-
-func TestRefreshExternalIdpTokenRequiresEndpoint(t *testing.T) {
-	if _, _, _, _, err := refreshExternalIdpToken("rt", "client", "", "scope", http.DefaultClient); err == nil {
-		t.Fatal("expected error when tokenEndpoint is empty")
-	}
-}
-
-func TestRefreshExternalIdpTokenPropagatesHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"error":"invalid_grant"}`)
-	}))
-	defer server.Close()
-
-	if _, _, _, _, err := refreshExternalIdpToken("rt", "client", server.URL, "scope", server.Client()); err == nil {
-		t.Fatal("expected error on non-200 response")
+	if !strings.Contains(gotBody, `"refreshToken":"entra-rt"`) {
+		t.Fatalf("expected refreshToken in body, got %q", gotBody)
 	}
 }
