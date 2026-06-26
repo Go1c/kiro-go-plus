@@ -895,6 +895,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", 405)
 		return
 	}
+	requestID := newClaudeRequestID()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -923,6 +924,8 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("request-id", requestID)
+	w.Header().Set("x-request-id", requestID)
 	json.NewEncoder(w).Encode(map[string]int{"input_tokens": estimatedTokens})
 }
 
@@ -977,10 +980,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+	requestID := newClaudeRequestID()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("request-id", requestID)
+	w.Header().Set("x-request-id", requestID)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -991,7 +997,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
 
-	msgID := "msg_" + uuid.New().String()
+	msgID := newClaudeMessageID()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -1428,7 +1434,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"stop_reason":   stopReason,
 				"stop_sequence": nil,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": map[string]int{"output_tokens": outputTokens},
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1521,6 +1527,7 @@ func (h *Handler) recordFailure() {
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, stopSequences []string) {
+	requestID := newClaudeRequestID()
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1635,6 +1642,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("request-id", requestID)
+		w.Header().Set("x-request-id", requestID)
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
@@ -1676,7 +1685,10 @@ func applyClaudeStopSequences(content string, stopSequences []string) (string, *
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
+	requestID := newClaudeRequestID()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("request-id", requestID)
+	w.Header().Set("x-request-id", requestID)
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"type": "error",
@@ -1684,6 +1696,7 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 			"type":    errType,
 			"message": message,
 		},
+		"request_id": requestID,
 	})
 }
 

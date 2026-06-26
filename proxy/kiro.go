@@ -725,10 +725,10 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 			}
 		}
 	} else if name != "" && current == nil {
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		current = &toolUseState{ToolUseID: newClaudeToolUseID(), Name: name, GeneratedID: true}
 	} else if name != "" && current != nil && current.Name != name {
 		finishToolUse(current, callback)
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		current = &toolUseState{ToolUseID: newClaudeToolUseID(), Name: name, GeneratedID: true}
 	}
 
 	if current != nil {
@@ -754,7 +754,7 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 		return
 	}
 	if state.ToolUseID == "" {
-		state.ToolUseID = "toolu_" + uuid.New().String()
+		state.ToolUseID = newClaudeToolUseID()
 	}
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {

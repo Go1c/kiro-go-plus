@@ -103,6 +103,9 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	if got := rec.Header().Get("request-id"); !strings.HasPrefix(got, "req_") || strings.Contains(got, "-") {
+		t.Fatalf("expected Anthropic request-id header, got %q", got)
+	}
 	if len(requestTokens) != 2 {
 		t.Fatalf("expected two account attempts, got %v", requestTokens)
 	}
@@ -120,6 +123,9 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 	if len(resp.Content) == 0 || resp.Content[0].Text != "retried successfully" {
 		t.Fatalf("expected retried response content, got %#v", resp.Content)
+	}
+	if strings.Contains(resp.ID, "-") {
+		t.Fatalf("expected Claude message id without hyphens, got %q", resp.ID)
 	}
 }
 
@@ -189,6 +195,9 @@ func TestClaudeStreamThinkingEmitsSignatureDelta(t *testing.T) {
 	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
 		t.Fatalf("expected X-Accel-Buffering disabled, got %q", got)
 	}
+	if got := rec.Header().Get("request-id"); !strings.HasPrefix(got, "req_") || strings.Contains(got, "-") {
+		t.Fatalf("expected Anthropic request-id header, got %q", got)
+	}
 
 	body := rec.Body.String()
 	signatureIdx := strings.Index(body, `"type":"signature_delta"`)
@@ -204,6 +213,18 @@ func TestClaudeStreamThinkingEmitsSignatureDelta(t *testing.T) {
 	}
 	if !strings.Contains(body, `"stop_sequence":null`) {
 		t.Fatalf("expected message_delta to include stop_sequence null, got:\n%s", body)
+	}
+	messageDeltaIdx := strings.Index(body, "event: message_delta")
+	if messageDeltaIdx < 0 {
+		t.Fatalf("expected message_delta event, got:\n%s", body)
+	}
+	messageStopIdx := strings.Index(body[messageDeltaIdx:], "event: message_stop")
+	messageDeltaBlock := body[messageDeltaIdx:]
+	if messageStopIdx >= 0 {
+		messageDeltaBlock = body[messageDeltaIdx : messageDeltaIdx+messageStopIdx]
+	}
+	if strings.Contains(messageDeltaBlock, `"input_tokens"`) {
+		t.Fatalf("message_delta usage must not include input_tokens, got:\n%s", messageDeltaBlock)
 	}
 }
 

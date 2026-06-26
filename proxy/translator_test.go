@@ -299,6 +299,9 @@ func TestKiroToClaudeResponseThinkingBlockIncludesSignature(t *testing.T) {
 	if !strings.HasPrefix(resp.Content[0].Signature, "EqQBCgIYAhIM") {
 		t.Fatalf("expected Claude-style thinking signature, got %q", resp.Content[0].Signature)
 	}
+	if !strings.HasPrefix(resp.ID, "msg_") || strings.Contains(resp.ID, "-") {
+		t.Fatalf("expected Anthropic-style message id without hyphens, got %q", resp.ID)
+	}
 }
 
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {

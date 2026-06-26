@@ -971,7 +971,7 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 	}
 
 	return &ClaudeResponse{
-		ID:         "msg_" + uuid.New().String(),
+		ID:         newClaudeMessageID(),
 		Type:       "message",
 		Role:       "assistant",
 		Content:    blocks,
@@ -987,6 +987,18 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 func claudeThinkingSignature(thinkingContent, model string) string {
 	sum := sha256.Sum256([]byte(model + "\x00" + thinkingContent))
 	return "EqQBCgIYAhIM" + base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func newClaudeMessageID() string {
+	return "msg_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+}
+
+func newClaudeRequestID() string {
+	return "req_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+}
+
+func newClaudeToolUseID() string {
+	return "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 }
 
 // ==================== OpenAI API 类型 ====================

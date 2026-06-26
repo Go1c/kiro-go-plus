@@ -7,6 +7,7 @@ import (
 	"kiro-go-plus/config"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,6 +128,9 @@ func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	}
 	if toolUses[0].ToolUseID == "" {
 		t.Fatalf("expected generated tool use id")
+	}
+	if strings.Contains(toolUses[0].ToolUseID, "-") {
+		t.Fatalf("expected generated tool use id without hyphens, got %q", toolUses[0].ToolUseID)
 	}
 	if toolUses[0].Name != "mcpIdaProMcpStatus" {
 		t.Fatalf("unexpected tool name: %q", toolUses[0].Name)
