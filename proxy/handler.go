@@ -432,7 +432,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// CORS - 完整的头部支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, anthropic-dangerous-direct-browser-access, x-app, x-claude-code-session-id, x-client-request-id, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method, accept-language, accept-encoding, sec-fetch-mode")
 	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
 
 	if r.Method == "OPTIONS" {
@@ -469,10 +469,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleOpenAIResponses(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
+	case strings.HasPrefix(path, "/v1/models/"):
+		h.handleModel(w, r, strings.TrimPrefix(path, "/v1/models/"))
+	case strings.HasPrefix(path, "/models/"):
+		h.handleModel(w, r, strings.TrimPrefix(path, "/models/"))
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
+	case path == "/api/claude_code/metrics" ||
+		path == "/api/claude_code/organizations/metrics_enabled" ||
+		strings.HasPrefix(path, "/api/eval/"):
+		h.handleClaudeCodeProbe(w, r)
 
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
@@ -571,7 +579,7 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	models := make([]map[string]interface{}, 0, len(cached)*2)
 	if len(cached) > 0 {
 		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
+			supportsImage := modelSupportsImageForModel(m.ModelId, m.InputTypes)
 			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
 			// 自动生成 thinking 变体
 			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
@@ -582,6 +590,8 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	return []map[string]interface{}{
+		buildModelInfo("claude-opus-4.8", "anthropic", true),
+		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.6", "anthropic", true),
@@ -597,6 +607,59 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 		buildModelInfo("claude-opus-4.5", "anthropic", true),
 		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
 	}
+}
+
+func (h *Handler) handleModel(w http.ResponseWriter, r *http.Request, modelID string) {
+	if r.Method != "GET" {
+		http.Error(w, "Method Not Allowed", 405)
+		return
+	}
+
+	thinkingSuffix := config.GetThinkingConfig().Suffix
+	actualModel, _ := ParseModelAndThinking(modelID, thinkingSuffix)
+	supportsImage := modelSupportsImageForModel(actualModel, nil)
+
+	h.modelsCacheMu.RLock()
+	cached := h.cachedModels
+	h.modelsCacheMu.RUnlock()
+	for _, m := range cached {
+		cachedModel, _ := ParseModelAndThinking(m.ModelId, thinkingSuffix)
+		if strings.EqualFold(cachedModel, actualModel) || strings.EqualFold(m.ModelId, actualModel) {
+			supportsImage = modelSupportsImageForModel(m.ModelId, m.InputTypes)
+			break
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(buildModelInfo(actualModel, "anthropic", supportsImage))
+}
+
+func (h *Handler) handleClaudeCodeProbe(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	switch {
+	case r.URL.Path == "/api/claude_code/organizations/metrics_enabled":
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled":         false,
+			"metrics_enabled": false,
+		})
+	case r.URL.Path == "/api/claude_code/metrics":
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	case strings.HasPrefix(r.URL.Path, "/api/eval/"):
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"features": map[string]interface{}{},
+		})
+	default:
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func modelSupportsImageForModel(modelID string, inputTypes []string) bool {
+	if modelSupportsImage(inputTypes) {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(lower, "claude-")
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -908,15 +971,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, req.StopSequences)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -975,6 +1039,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
+		var thinkingBlockForSignature strings.Builder
 		activeBlockIndex := -1
 		activeBlockType := ""
 
@@ -1022,6 +1087,20 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 			activeBlockIndex = idx
 			activeBlockType = blockType
+		}
+
+		sendThinkingSignatureDelta := func() {
+			if activeBlockType != "thinking" || activeBlockIndex < 0 {
+				return
+			}
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": activeBlockIndex,
+				"delta": map[string]string{
+					"type":      "signature_delta",
+					"signature": claudeThinkingSignature(thinkingBlockForSignature.String(), model),
+				},
+			})
 		}
 
 		var textBuffer string
@@ -1080,6 +1159,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					"delta": map[string]string{"type": "text_delta", "text": text},
 				})
 			default:
+				if thinkingState == 1 {
+					thinkingBlockForSignature.Reset()
+				}
+				if text != "" {
+					thinkingBlockForSignature.WriteString(text)
+				}
 				if thinkingOpts.OmitDisplay {
 					if thinkingState == 1 {
 						startContentBlock("thinking")
@@ -1089,13 +1174,17 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						if activeBlockType != "thinking" {
 							startContentBlock("thinking")
 						}
+						sendThinkingSignatureDelta()
 						closeActiveBlock()
+						thinkingBlockForSignature.Reset()
 					}
 					return
 				}
 				if thinkingState == 3 && text == "" {
 					if activeBlockType == "thinking" {
+						sendThinkingSignatureDelta()
 						closeActiveBlock()
+						thinkingBlockForSignature.Reset()
 					}
 					return
 				}
@@ -1108,7 +1197,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					})
 				}
 				if thinkingState == 3 && activeBlockType == "thinking" {
+					sendThinkingSignatureDelta()
 					closeActiveBlock()
+					thinkingBlockForSignature.Reset()
 				}
 			}
 		}
@@ -1334,7 +1425,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
-				"stop_reason": stopReason,
+				"stop_reason":   stopReason,
+				"stop_sequence": nil,
 			},
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
@@ -1428,7 +1520,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, stopSequences []string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1523,7 +1615,16 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
+		finalContent, matchedStopSequence := applyClaudeStopSequences(finalContent, stopSequences)
+		if matchedStopSequence != nil {
+			outputTokens = estimateClaudeOutputTokens(finalContent, responseThinkingContent, toolUses)
+		}
+
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		if matchedStopSequence != nil && len(toolUses) == 0 {
+			resp.StopReason = "stop_sequence"
+			resp.StopSequence = matchedStopSequence
+		}
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -1545,6 +1646,33 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 	h.recordFailure()
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+}
+
+func applyClaudeStopSequences(content string, stopSequences []string) (string, *string) {
+	if content == "" || len(stopSequences) == 0 {
+		return content, nil
+	}
+
+	bestIndex := -1
+	bestSequence := ""
+	for _, sequence := range stopSequences {
+		if sequence == "" {
+			continue
+		}
+		idx := strings.Index(content, sequence)
+		if idx < 0 {
+			continue
+		}
+		if bestIndex == -1 || idx < bestIndex {
+			bestIndex = idx
+			bestSequence = sequence
+		}
+	}
+
+	if bestIndex < 0 {
+		return content, nil
+	}
+	return content[:bestIndex], &bestSequence
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {

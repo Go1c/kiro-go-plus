@@ -279,8 +279,25 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	if resp.Content[0].Thinking != "" {
 		t.Fatalf("expected omitted thinking block to have empty content, got %#v", resp.Content[0].Thinking)
 	}
+	if resp.Content[0].Signature == "" {
+		t.Fatalf("expected thinking block to include a signature")
+	}
 	if resp.Content[1].Type != "text" || resp.Content[1].Text != "final answer" {
 		t.Fatalf("expected text block to be preserved, got %#v", resp.Content[1])
+	}
+}
+
+func TestKiroToClaudeResponseThinkingBlockIncludesSignature(t *testing.T) {
+	resp := KiroToClaudeResponse("final answer", "private reasoning", false, nil, 10, 20, "claude-opus-4.8")
+
+	if len(resp.Content) != 2 {
+		t.Fatalf("expected thinking and text blocks, got %d", len(resp.Content))
+	}
+	if resp.Content[0].Type != "thinking" || resp.Content[0].Thinking != "private reasoning" {
+		t.Fatalf("expected thinking block first, got %#v", resp.Content[0])
+	}
+	if !strings.HasPrefix(resp.Content[0].Signature, "EqQBCgIYAhIM") {
+		t.Fatalf("expected Claude-style thinking signature, got %q", resp.Content[0].Signature)
 	}
 }
 

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -120,16 +121,21 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Model         string                 `json:"model"`
+	Messages      []ClaudeMessage        `json:"messages"`
+	MaxTokens     int                    `json:"max_tokens"`
+	Temperature   float64                `json:"temperature,omitempty"`
+	TopP          float64                `json:"top_p,omitempty"`
+	TopK          int                    `json:"top_k,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Stream        bool                   `json:"stream,omitempty"`
+	System        interface{}            `json:"system,omitempty"` // string or []SystemBlock
+	Thinking      *ClaudeThinkingConfig  `json:"thinking,omitempty"`
+	Tools         []ClaudeTool           `json:"tools,omitempty"`
+	ToolChoice    interface{}            `json:"tool_choice,omitempty"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+	Container     interface{}            `json:"container,omitempty"`
+	ServiceTier   string                 `json:"service_tier,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -937,8 +943,9 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
 		blocks = append(blocks, ClaudeContentBlock{
-			Type:     "thinking",
-			Thinking: thinkingContent,
+			Type:      "thinking",
+			Thinking:  thinkingContent,
+			Signature: claudeThinkingSignature(thinkingContent, model),
 		})
 	}
 
@@ -975,6 +982,11 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 			OutputTokens: outputTokens,
 		},
 	}
+}
+
+func claudeThinkingSignature(thinkingContent, model string) string {
+	sum := sha256.Sum256([]byte(model + "\x00" + thinkingContent))
+	return "EqQBCgIYAhIM" + base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // ==================== OpenAI API 类型 ====================

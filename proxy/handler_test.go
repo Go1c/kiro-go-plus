@@ -98,7 +98,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "", nil)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -123,6 +123,90 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 }
 
+func TestClaudeStreamThinkingEmitsSignatureDelta(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "streamer",
+		Enabled:     true,
+		AccessToken: "token-streamer",
+		ProfileArn:  "arn:aws:codewhisperer:profile/streamer",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "private reasoning",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "final answer",
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: "claude-opus-4.8",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeStream(rec, payload, "claude-opus-4.8", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
+
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache, no-transform" {
+		t.Fatalf("expected SSE cache-control no-transform, got %q", got)
+	}
+	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("expected X-Accel-Buffering disabled, got %q", got)
+	}
+
+	body := rec.Body.String()
+	signatureIdx := strings.Index(body, `"type":"signature_delta"`)
+	if signatureIdx < 0 {
+		t.Fatalf("expected stream to include signature_delta, got:\n%s", body)
+	}
+	stopIdx := strings.Index(body, "event: content_block_stop")
+	if stopIdx < 0 || signatureIdx > stopIdx {
+		t.Fatalf("expected signature_delta before thinking content_block_stop, got:\n%s", body)
+	}
+	if !strings.Contains(body, `"type":"text_delta"`) || !strings.Contains(body, `"text":"final answer"`) {
+		t.Fatalf("expected final text after thinking block, got:\n%s", body)
+	}
+	if !strings.Contains(body, `"stop_sequence":null`) {
+		t.Fatalf("expected message_delta to include stop_sequence null, got:\n%s", body)
+	}
+}
+
 func TestThinkingSourceTagFirst(t *testing.T) {
 	var source thinkingStreamSource
 
@@ -134,6 +218,26 @@ func TestThinkingSourceTagFirst(t *testing.T) {
 	}
 	if allowReasoningSource(&source) {
 		t.Fatalf("expected reasoning source to be rejected after tag source selected")
+	}
+}
+
+func TestApplyClaudeStopSequencesUsesEarliestMatch(t *testing.T) {
+	content, matched := applyClaudeStopSequences("alpha STOP beta HALT gamma", []string{"HALT", "STOP"})
+	if content != "alpha " {
+		t.Fatalf("expected content truncated at earliest stop sequence, got %q", content)
+	}
+	if matched == nil || *matched != "STOP" {
+		t.Fatalf("expected matched stop sequence STOP, got %#v", matched)
+	}
+}
+
+func TestApplyClaudeStopSequencesIgnoresEmptySequences(t *testing.T) {
+	content, matched := applyClaudeStopSequences("alpha beta", []string{"", "zzz"})
+	if content != "alpha beta" {
+		t.Fatalf("expected content unchanged, got %q", content)
+	}
+	if matched != nil {
+		t.Fatalf("expected no matched stop sequence, got %#v", matched)
 	}
 }
 
@@ -478,5 +582,24 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+func TestFallbackAnthropicModelsIncludesOpus48(t *testing.T) {
+	models := fallbackAnthropicModels("-thinking")
+	var foundBase, foundThinking bool
+	for _, model := range models {
+		switch model["id"] {
+		case "claude-opus-4.8":
+			foundBase = true
+			if supportsImage, ok := model["supports_image"].(bool); !ok || !supportsImage {
+				t.Fatalf("expected opus 4.8 to advertise image support, got %#v", model["supports_image"])
+			}
+		case "claude-opus-4.8-thinking":
+			foundThinking = true
+		}
+	}
+	if !foundBase || !foundThinking {
+		t.Fatalf("expected fallback models to include opus 4.8 variants, got %#v", models)
 	}
 }
