@@ -908,6 +908,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
+	req = *sanitizeClaudeSignatureSensitiveHistory(&req)
 	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
@@ -952,6 +953,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+	req = *sanitizeClaudeSignatureSensitiveHistory(&req)
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return

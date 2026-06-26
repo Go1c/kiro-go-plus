@@ -304,6 +304,86 @@ func TestKiroToClaudeResponseThinkingBlockIncludesSignature(t *testing.T) {
 	}
 }
 
+func TestSanitizeClaudeSignatureSensitiveHistoryConvertsThinkingBlocks(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "start"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "visible"},
+				map[string]interface{}{"type": "thinking", "thinking": "private plan", "signature": "bad"},
+				map[string]interface{}{"type": "redacted_thinking", "data": "opaque"},
+				map[string]interface{}{"thinking": "legacy plan", "signature": "also-bad"},
+				map[string]interface{}{"type": "tool_use", "id": "t1", "name": "read", "input": map[string]interface{}{"path": "a.txt"}},
+			}},
+			{Role: "user", Content: "continue"},
+		},
+	}
+
+	sanitized := sanitizeClaudeSignatureSensitiveHistory(req)
+	blocks, ok := sanitized.Messages[1].Content.([]interface{})
+	if !ok {
+		t.Fatalf("expected sanitized content blocks, got %#v", sanitized.Messages[1].Content)
+	}
+
+	var texts []string
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if block["type"] == "redacted_thinking" {
+			t.Fatalf("redacted_thinking block should be removed: %#v", block)
+		}
+		if block["signature"] != nil {
+			t.Fatalf("signature field should not survive sanitization: %#v", block)
+		}
+		if block["type"] == "text" {
+			texts = append(texts, block["text"].(string))
+		}
+	}
+
+	joined := strings.Join(texts, "\n")
+	if !strings.Contains(joined, "visible") || !strings.Contains(joined, "private plan") || !strings.Contains(joined, "legacy plan") {
+		t.Fatalf("expected text and thinking content to survive as text, got %q", joined)
+	}
+
+	originalBlocks := req.Messages[1].Content.([]interface{})
+	if originalBlocks[1].(map[string]interface{})["type"] != "thinking" {
+		t.Fatalf("sanitization should not mutate the original request")
+	}
+}
+
+func TestClaudeToKiroPreservesSanitizedThinkingHistory(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "start"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "thinking", "thinking": "private plan", "signature": "bad"},
+				map[string]interface{}{"type": "redacted_thinking", "data": "opaque"},
+			}},
+			{Role: "user", Content: "continue"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	var historyText strings.Builder
+	for _, h := range payload.ConversationState.History {
+		if h.AssistantResponseMessage != nil {
+			historyText.WriteString(h.AssistantResponseMessage.Content)
+		}
+	}
+
+	got := historyText.String()
+	if !strings.Contains(got, "private plan") {
+		t.Fatalf("expected sanitized thinking to survive in assistant history, got %q", got)
+	}
+	if strings.Contains(got, "opaque") || strings.Contains(got, "bad") {
+		t.Fatalf("redacted data and signatures must not survive in history, got %q", got)
+	}
+}
+
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",

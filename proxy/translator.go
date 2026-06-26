@@ -203,6 +203,8 @@ type ClaudeUsage struct {
 const maxToolDescLen = 10237
 
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+	req = sanitizeClaudeSignatureSensitiveHistory(req)
+
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -602,6 +604,92 @@ func hasClaudeSystemContent(system interface{}) bool {
 		return len(v) > 0
 	default:
 		return true
+	}
+}
+
+func sanitizeClaudeSignatureSensitiveHistory(req *ClaudeRequest) *ClaudeRequest {
+	if req == nil {
+		return nil
+	}
+
+	cloned := *req
+	if len(req.Messages) == 0 {
+		return &cloned
+	}
+
+	cloned.Messages = make([]ClaudeMessage, len(req.Messages))
+	for i, msg := range req.Messages {
+		cloned.Messages[i] = msg
+		if sanitized, changed := sanitizeClaudeContentBlocks(msg.Content); changed {
+			cloned.Messages[i].Content = sanitized
+		}
+	}
+	return &cloned
+}
+
+func sanitizeClaudeContentBlocks(content interface{}) (interface{}, bool) {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return content, false
+	}
+
+	sanitized := make([]interface{}, 0, len(blocks))
+	changed := false
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]interface{})
+		if !ok {
+			sanitized = append(sanitized, raw)
+			continue
+		}
+
+		replacement, blockChanged := sanitizeClaudeContentBlock(block)
+		if replacement == nil {
+			changed = true
+			continue
+		}
+		if blockChanged {
+			changed = true
+		}
+		sanitized = append(sanitized, replacement)
+	}
+
+	if !changed {
+		return content, false
+	}
+	if len(sanitized) == 0 {
+		sanitized = append(sanitized, map[string]interface{}{
+			"type": "text",
+			"text": "(content removed)",
+		})
+	}
+	return sanitized, true
+}
+
+func sanitizeClaudeContentBlock(block map[string]interface{}) (interface{}, bool) {
+	blockType, _ := block["type"].(string)
+	switch blockType {
+	case "thinking":
+		thinking, _ := block["thinking"].(string)
+		if strings.TrimSpace(thinking) == "" {
+			return nil, true
+		}
+		return map[string]interface{}{
+			"type": "text",
+			"text": thinking,
+		}, true
+	case "redacted_thinking":
+		return nil, true
+	case "":
+		thinking, _ := block["thinking"].(string)
+		if strings.TrimSpace(thinking) == "" {
+			return block, false
+		}
+		return map[string]interface{}{
+			"type": "text",
+			"text": thinking,
+		}, true
+	default:
+		return block, false
 	}
 }
 
