@@ -98,7 +98,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "", nil)
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", "claude-sonnet-4-5", false, claudeThinkingResponseOptions{}, 1, nil, "", nil, 0)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -126,6 +126,137 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 	if strings.Contains(resp.ID, "-") {
 		t.Fatalf("expected Claude message id without hyphens, got %q", resp.ID)
+	}
+	if resp.Model != "claude-sonnet-4-5" {
+		t.Fatalf("expected response to preserve requested model id, got %q", resp.Model)
+	}
+	if !strings.Contains(rec.Body.String(), `"cache_creation_input_tokens":0`) ||
+		!strings.Contains(rec.Body.String(), `"cache_read_input_tokens":0`) {
+		t.Fatalf("expected zero cache usage fields to be present, got %s", rec.Body.String())
+	}
+}
+
+func TestClaudeNonStreamAppliesMaxTokensWhenBackendIgnoresLimit(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "only",
+		Enabled:     true,
+		AccessToken: "token-only",
+		ProfileArn:  "arn:aws:codewhisperer:profile/only",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "This response is intentionally much longer than the requested output budget.",
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "write a long answer",
+		ModelID: "claude-opus-4.8",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeNonStream(rec, payload, "claude-opus-4.8", "claude-opus-4-8", false, claudeThinkingResponseOptions{}, 1, nil, "", nil, 5)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.StopReason != "max_tokens" {
+		t.Fatalf("expected max_tokens stop reason, got %q", resp.StopReason)
+	}
+	if resp.Usage.OutputTokens != 5 {
+		t.Fatalf("expected output tokens capped to 5, got %d", resp.Usage.OutputTokens)
+	}
+	if len(resp.Content) == 0 || len([]rune(resp.Content[0].Text)) > 20 {
+		t.Fatalf("expected text truncated to about max_tokens*4 chars, got %#v", resp.Content)
+	}
+	if resp.Model != "claude-opus-4-8" {
+		t.Fatalf("expected requested model to be preserved, got %q", resp.Model)
+	}
+}
+
+func TestClaudeMessagesLocalForcedToolChoice(t *testing.T) {
+	h := &Handler{
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	body := `{
+		"model":"claude-opus-4-8",
+		"max_tokens":128,
+		"tools":[{
+			"name":"get_weather",
+			"description":"Get weather",
+			"input_schema":{
+				"type":"object",
+				"properties":{"location":{"type":"string"}},
+				"required":["location"]
+			}
+		}],
+		"tool_choice":{"type":"tool","name":"get_weather"},
+		"messages":[{"role":"user","content":"weather in Tokyo"}]
+	}`
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	h.handleClaudeMessagesInternal(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Model != "claude-opus-4-8" {
+		t.Fatalf("expected requested model to be preserved, got %q", resp.Model)
+	}
+	if resp.StopReason != "tool_use" || len(resp.Content) != 1 || resp.Content[0].Type != "tool_use" {
+		t.Fatalf("expected tool_use response, got %#v", resp)
+	}
+	if resp.Content[0].Name != "get_weather" {
+		t.Fatalf("expected get_weather tool, got %#v", resp.Content[0])
+	}
+	input, ok := resp.Content[0].Input.(map[string]interface{})
+	if !ok || input["location"] != "Tokyo" {
+		t.Fatalf("expected Tokyo input, got %#v", resp.Content[0].Input)
 	}
 }
 
@@ -187,7 +318,7 @@ func TestClaudeStreamThinkingEmitsSignatureDelta(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeStream(rec, payload, "claude-opus-4.8", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
+	h.handleClaudeStream(rec, payload, "claude-opus-4.8", "claude-opus-4-8", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
 
 	if got := rec.Header().Get("Cache-Control"); got != "no-cache, no-transform" {
 		t.Fatalf("expected SSE cache-control no-transform, got %q", got)
