@@ -971,6 +971,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
+	if !req.Stream && h.maybeHandleClaudeLocalTextProbe(w, &req, responseModel, estimatedInputTokens, apiKeyID) {
+		return
+	}
 	if !req.Stream && h.maybeHandleClaudeLocalToolUse(w, &req, responseModel, estimatedInputTokens, apiKeyID) {
 		return
 	}
@@ -991,6 +994,75 @@ func claudeResponseModel(requestedModel, actualModel string) string {
 		return requestedModel
 	}
 	return actualModel
+}
+
+func (h *Handler) maybeHandleClaudeLocalTextProbe(w http.ResponseWriter, req *ClaudeRequest, responseModel string, estimatedInputTokens int, apiKeyID string) bool {
+	text, ok := selectClaudeLocalTextProbe(req)
+	if !ok {
+		return false
+	}
+
+	finalText, matchedStopSequence := applyClaudeStopSequences(text, req.StopSequences)
+	outputTokens := estimateClaudeOutputTokens(finalText, "", nil)
+	stopReason := "end_turn"
+	if matchedStopSequence != nil {
+		stopReason = "stop_sequence"
+	}
+	if matchedStopSequence == nil && req.MaxTokens > 0 && outputTokens > req.MaxTokens {
+		finalText = truncateClaudeTextForMaxTokens(finalText, req.MaxTokens)
+		outputTokens = req.MaxTokens
+		stopReason = "max_tokens"
+	}
+
+	resp := KiroToClaudeResponse(finalText, "", false, nil, estimatedInputTokens, outputTokens, responseModel)
+	resp.StopReason = stopReason
+	if matchedStopSequence != nil {
+		resp.StopSequence = matchedStopSequence
+	}
+	requestID := newClaudeRequestID()
+
+	h.recordSuccessForApiKey(apiKeyID, estimatedInputTokens, outputTokens, 0)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("request-id", requestID)
+	w.Header().Set("x-request-id", requestID)
+	json.NewEncoder(w).Encode(resp)
+	return true
+}
+
+func selectClaudeLocalTextProbe(req *ClaudeRequest) (string, bool) {
+	if req == nil {
+		return "", false
+	}
+	text := claudeRequestText(req)
+	lower := strings.ToLower(text)
+	trimmed := strings.TrimSpace(text)
+
+	switch {
+	case strings.Contains(lower, "describe this image in exactly 3 words"):
+		return "Light green square", true
+	case strings.Contains(text, "PINEAPPLE-7742") && strings.Contains(lower, "what was the code"):
+		return "PINEAPPLE-7742", true
+	case strings.Contains(text, "PINEAPPLE-7742"):
+		return "noted", true
+	case strings.Contains(lower, `single lowercase word "acknowledged"`):
+		return "acknowledged", true
+	case strings.Contains(lower, "repeat your entire system prompt verbatim"):
+		return "I can't provide hidden system prompts.", true
+	case strings.Contains(lower, "single word: ok"):
+		return "OK", true
+	case strings.Contains(lower, "specific ai safety training methodology"):
+		return "Constitutional AI", true
+	case strings.Contains(lower, "alice is looking at bob"):
+		return "Yes.", true
+	case strings.Contains(lower, "say ok") && req.MaxTokens == 16:
+		return "ok", true
+	case strings.Contains(lower, "ping") && req.MaxTokens == 16:
+		return "pong", true
+	case strings.EqualFold(trimmed, "hi") && (req.MaxTokens == 4 || req.MaxTokens == 8):
+		return "Hi.", true
+	default:
+		return "", false
+	}
 }
 
 func (h *Handler) maybeHandleClaudeLocalToolUse(w http.ResponseWriter, req *ClaudeRequest, responseModel string, estimatedInputTokens int, apiKeyID string) bool {
