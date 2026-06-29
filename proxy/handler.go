@@ -1212,6 +1212,11 @@ func claudeContentText(content interface{}) string {
 		}
 		return strings.Join(parts, "\n")
 	case map[string]interface{}:
+		if blockType, _ := value["type"].(string); blockType == "document" || blockType == "file" || blockType == "input_file" {
+			if text := extractClaudeDocumentText(value); text != "" {
+				return text
+			}
+		}
 		var parts []string
 		for _, key := range []string{"text", "thinking", "content"} {
 			if text := claudeContentText(value[key]); text != "" {
@@ -1239,6 +1244,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
 		return
 	}
+	h.sendSSEComment(w, flusher, "ping")
 
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
@@ -1264,6 +1270,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"model":         responseModel,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
+				"stop_details":  nil,
 				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
 			},
 		})
@@ -1294,6 +1301,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingBlockForSignature strings.Builder
 		activeBlockIndex := -1
 		activeBlockType := ""
+		sentPingEvent := false
+
+		sendPingEvent := func() {
+			if sentPingEvent {
+				return
+			}
+			h.sendSSE(w, flusher, "ping", map[string]string{"type": "ping"})
+			sentPingEvent = true
+		}
 
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
@@ -1336,6 +1352,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 			}
+			sendPingEvent()
 
 			activeBlockIndex = idx
 			activeBlockType = blockType
@@ -1592,12 +1609,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tu.ToolUseID,
-						"name":  tu.Name,
-						"input": map[string]interface{}{},
+						"type":   "tool_use",
+						"id":     tu.ToolUseID,
+						"name":   tu.Name,
+						"input":  map[string]interface{}{},
+						"caller": map[string]string{"type": "direct"},
 					},
 				})
+				sendPingEvent()
 
 				inputJSON, _ := json.Marshal(tu.Input)
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
@@ -1661,6 +1680,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			thinkingOutput = ""
 		}
+		thinkingTokens := estimateApproxTokens(thinkingOutput)
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -1679,8 +1699,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason":   stopReason,
 				"stop_sequence": nil,
+				"stop_details":  nil,
 			},
-			"usage": map[string]int{"output_tokens": outputTokens},
+			"usage": buildClaudeStreamDeltaUsage(inputTokens, outputTokens, cacheUsage, thinkingTokens),
+			"context_management": map[string]interface{}{
+				"applied_edits": []interface{}{},
+			},
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1702,6 +1726,23 @@ func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event str
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
 	flusher.Flush()
+}
+
+func (h *Handler) sendSSEComment(w http.ResponseWriter, flusher http.Flusher, comment string) {
+	fmt.Fprintf(w, ": %s\n\n", comment)
+	flusher.Flush()
+}
+
+func buildClaudeStreamDeltaUsage(inputTokens, outputTokens int, usage promptCacheUsage, thinkingTokens int) map[string]interface{} {
+	return map[string]interface{}{
+		"input_tokens":                billedClaudeInputTokens(inputTokens, usage),
+		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
+		"cache_read_input_tokens":     usage.CacheReadInputTokens,
+		"output_tokens":               outputTokens,
+		"output_tokens_details": map[string]int{
+			"thinking_tokens": thinkingTokens,
+		},
+	}
 }
 
 // backgroundStatsSaver 后台定时保存统计数据

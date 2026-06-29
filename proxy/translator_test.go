@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -659,6 +660,70 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	}
 	if !strings.Contains(cur.Content, "here is the screenshot") {
 		t.Fatalf("expected original tool text preserved, got %q", cur.Content)
+	}
+}
+
+func TestClaudeToKiroExtractsTextDocumentBlock(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{{
+			Role: "user",
+			Content: []interface{}{
+				map[string]interface{}{
+					"type":  "document",
+					"title": "note.txt",
+					"source": map[string]interface{}{
+						"type":       "text",
+						"media_type": "text/plain",
+						"data":       "The project codename is ORCHID-913.",
+					},
+				},
+				map[string]interface{}{"type": "text", "text": "What is the project codename?"},
+			},
+		}},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(content, "[Document: note.txt]") || !strings.Contains(content, "ORCHID-913") {
+		t.Fatalf("expected document text to be included in prompt, got %q", content)
+	}
+	if !strings.Contains(content, "What is the project codename?") {
+		t.Fatalf("expected user question to remain in prompt, got %q", content)
+	}
+}
+
+func TestClaudeDocumentExtractionSupportsBase64PDFText(t *testing.T) {
+	pdf := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 56 >>
+stream
+BT /F1 12 Tf 72 720 Td (Invoice total: ALPHA-42) Tj ET
+endstream
+endobj
+%%EOF`
+	block := map[string]interface{}{
+		"type": "document",
+		"name": "invoice.pdf",
+		"source": map[string]interface{}{
+			"type":       "base64",
+			"media_type": "application/pdf",
+			"data":       base64.StdEncoding.EncodeToString([]byte(pdf)),
+		},
+	}
+
+	got := extractClaudeDocumentText(block)
+	if !strings.Contains(got, "[Document: invoice.pdf]") || !strings.Contains(got, "ALPHA-42") {
+		t.Fatalf("expected PDF text extraction, got %q", got)
 	}
 }
 

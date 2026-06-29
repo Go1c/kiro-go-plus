@@ -408,6 +408,12 @@ func TestClaudeStreamThinkingEmitsSignatureDelta(t *testing.T) {
 	}
 
 	body := rec.Body.String()
+	if !strings.HasPrefix(body, ": ping\n\n") {
+		t.Fatalf("expected stream to start with Claude ping comment, got:\n%s", body)
+	}
+	if !strings.Contains(body, "event: ping") {
+		t.Fatalf("expected stream to include ping event, got:\n%s", body)
+	}
 	signatureIdx := strings.Index(body, `"type":"signature_delta"`)
 	if signatureIdx < 0 {
 		t.Fatalf("expected stream to include signature_delta, got:\n%s", body)
@@ -431,8 +437,11 @@ func TestClaudeStreamThinkingEmitsSignatureDelta(t *testing.T) {
 	if messageStopIdx >= 0 {
 		messageDeltaBlock = body[messageDeltaIdx : messageDeltaIdx+messageStopIdx]
 	}
-	if strings.Contains(messageDeltaBlock, `"input_tokens"`) {
-		t.Fatalf("message_delta usage must not include input_tokens, got:\n%s", messageDeltaBlock)
+	if !strings.Contains(messageDeltaBlock, `"input_tokens"`) ||
+		!strings.Contains(messageDeltaBlock, `"cache_creation_input_tokens"`) ||
+		!strings.Contains(messageDeltaBlock, `"output_tokens_details"`) ||
+		!strings.Contains(messageDeltaBlock, `"context_management"`) {
+		t.Fatalf("message_delta usage must include Claude stream usage details, got:\n%s", messageDeltaBlock)
 	}
 }
 

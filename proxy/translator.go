@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"kiro-go-plus/config"
 	"regexp"
 	"strings"
@@ -160,6 +163,8 @@ type ClaudeContentBlock struct {
 	ToolUseID string       `json:"tool_use_id,omitempty"`
 	Content   interface{}  `json:"content,omitempty"` // for tool_result
 	Source    *ImageSource `json:"source,omitempty"`
+	Caller    interface{}  `json:"caller,omitempty"`
+	Citations interface{}  `json:"citations,omitempty"`
 }
 
 type ImageSource struct {
@@ -169,20 +174,24 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
+	Type        string      `json:"type,omitempty"`
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
+	MaxUses     int         `json:"max_uses,omitempty"`
 }
 
 type ClaudeResponse struct {
-	ID           string               `json:"id"`
-	Type         string               `json:"type"`
-	Role         string               `json:"role"`
-	Content      []ClaudeContentBlock `json:"content"`
-	Model        string               `json:"model"`
-	StopReason   string               `json:"stop_reason"`
-	StopSequence *string              `json:"stop_sequence"`
-	Usage        ClaudeUsage          `json:"usage"`
+	ID                string                 `json:"id"`
+	Type              string                 `json:"type"`
+	Role              string                 `json:"role"`
+	Content           []ClaudeContentBlock   `json:"content"`
+	Model             string                 `json:"model"`
+	StopReason        string                 `json:"stop_reason"`
+	StopSequence      *string                `json:"stop_sequence"`
+	StopDetails       interface{}            `json:"stop_details"`
+	Usage             ClaudeUsage            `json:"usage"`
+	ContextManagement map[string]interface{} `json:"context_management,omitempty"`
 }
 
 type ClaudeCacheCreationUsage struct {
@@ -196,6 +205,10 @@ type ClaudeUsage struct {
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens"`
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+	OutputTokensDetails      map[string]int            `json:"output_tokens_details,omitempty"`
+	ServiceTier              string                    `json:"service_tier,omitempty"`
+	InferenceGeo             string                    `json:"inference_geo,omitempty"`
+	ServerToolUse            map[string]int            `json:"server_tool_use,omitempty"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -736,6 +749,10 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				if t, ok := block["text"].(string); ok {
 					text += t
 				}
+			case "document", "file", "input_file":
+				if docText := extractClaudeDocumentText(block); docText != "" {
+					text = joinHistoryText(text, docText)
+				}
 			case "image", "image_url", "input_image":
 				if img := extractImageFromClaudeBlock(block); img != nil {
 					images = append(images, *img)
@@ -797,6 +814,287 @@ func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
 	}
 
 	return nil
+}
+
+func extractClaudeDocumentText(block map[string]interface{}) string {
+	if block == nil {
+		return ""
+	}
+	if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+		return formatClaudeDocumentText(block, text)
+	}
+	for _, key := range []string{"source", "file"} {
+		if source, ok := block[key].(map[string]interface{}); ok {
+			if text := extractClaudeDocumentSourceText(block, source); text != "" {
+				return text
+			}
+		}
+	}
+	if content, ok := block["content"]; ok {
+		if text := claudeContentText(content); strings.TrimSpace(text) != "" {
+			return formatClaudeDocumentText(block, text)
+		}
+	}
+	return ""
+}
+
+func extractClaudeDocumentSourceText(block, source map[string]interface{}) string {
+	sourceType := strings.ToLower(firstMapString(source, "type"))
+	mediaType := firstMapString(source, "media_type", "mime_type", "mime")
+	if mediaType == "" {
+		mediaType = firstMapString(block, "media_type", "mime_type", "mime")
+	}
+	data := firstMapString(source, "data", "base64", "content")
+	if data == "" {
+		return ""
+	}
+
+	switch sourceType {
+	case "text":
+		return formatClaudeDocumentText(block, data)
+	case "base64", "":
+		if parsedMediaType, decoded, ok := decodeClaudeDocumentData(data); ok {
+			if mediaType == "" {
+				mediaType = parsedMediaType
+			}
+			if text := decodeClaudeDocumentBytes(decoded, mediaType); text != "" {
+				return formatClaudeDocumentText(block, text)
+			}
+		}
+		if isTextDocumentMediaType(mediaType) {
+			return formatClaudeDocumentText(block, data)
+		}
+	}
+	return ""
+}
+
+func decodeClaudeDocumentData(data string) (string, []byte, bool) {
+	cleaned := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(data, "\n", ""), "\r", ""))
+	mediaType := ""
+	if strings.HasPrefix(strings.ToLower(cleaned), "data:") {
+		comma := strings.Index(cleaned, ",")
+		if comma < 0 {
+			return "", nil, false
+		}
+		meta := cleaned[5:comma]
+		cleaned = cleaned[comma+1:]
+		for _, part := range strings.Split(meta, ";") {
+			if strings.Contains(part, "/") {
+				mediaType = part
+				break
+			}
+		}
+	}
+
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(cleaned); err == nil {
+			return mediaType, decoded, true
+		}
+	}
+	return "", nil, false
+}
+
+func decodeClaudeDocumentBytes(data []byte, mediaType string) string {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	switch {
+	case mediaType == "application/pdf" || bytes.HasPrefix(bytes.TrimSpace(data), []byte("%PDF-")):
+		return extractSimplePDFText(data)
+	case isTextDocumentMediaType(mediaType):
+		return sanitizeDecodedDocumentText(string(data))
+	default:
+		text := sanitizeDecodedDocumentText(string(data))
+		if printableTextRatio(text) > 0.7 {
+			return text
+		}
+		return ""
+	}
+}
+
+func isTextDocumentMediaType(mediaType string) bool {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType == "" {
+		return false
+	}
+	return strings.HasPrefix(mediaType, "text/") ||
+		strings.Contains(mediaType, "json") ||
+		strings.Contains(mediaType, "xml") ||
+		strings.Contains(mediaType, "yaml") ||
+		strings.Contains(mediaType, "csv") ||
+		strings.Contains(mediaType, "markdown")
+}
+
+func formatClaudeDocumentText(block map[string]interface{}, text string) string {
+	text = limitDocumentText(sanitizeDecodedDocumentText(text), 12000)
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	name := firstMapString(block, "title", "name", "filename")
+	if name == "" {
+		return "[Document]\n" + text
+	}
+	return "[Document: " + name + "]\n" + text
+}
+
+func sanitizeDecodedDocumentText(text string) string {
+	text = strings.ReplaceAll(text, "\x00", "")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
+	var b strings.Builder
+	lastSpace := false
+	for _, r := range text {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+			lastSpace = false
+		case r >= 32 && r != 0x7f:
+			b.WriteRune(r)
+			lastSpace = false
+		case !lastSpace:
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+
+	lines := strings.Split(b.String(), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func printableTextRatio(text string) float64 {
+	if text == "" {
+		return 0
+	}
+	printable := 0
+	total := 0
+	for _, r := range text {
+		total++
+		if r == '\n' || r == '\t' || r >= 32 {
+			printable++
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(printable) / float64(total)
+}
+
+func limitDocumentText(text string, maxLen int) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= maxLen {
+		return text
+	}
+	return strings.TrimSpace(text[:maxLen]) + "\n[Document truncated]"
+}
+
+func extractSimplePDFText(data []byte) string {
+	var parts []string
+	if text := extractPDFTextStrings(string(data)); text != "" {
+		parts = append(parts, text)
+	}
+
+	streamRe := regexp.MustCompile(`(?s)<<(.*?)>>\s*stream\r?\n?(.*?)\r?\n?endstream`)
+	for _, match := range streamRe.FindAllSubmatch(data, -1) {
+		dict := string(match[1])
+		stream := bytes.Trim(match[2], "\r\n ")
+		if strings.Contains(dict, "/FlateDecode") {
+			zr, err := zlib.NewReader(bytes.NewReader(stream))
+			if err == nil {
+				if decoded, readErr := io.ReadAll(zr); readErr == nil {
+					stream = decoded
+				}
+				_ = zr.Close()
+			}
+		}
+		if text := extractPDFTextStrings(string(stream)); text != "" {
+			parts = append(parts, text)
+		}
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return sanitizeDecodedDocumentText(strings.Join(parts, "\n"))
+}
+
+func extractPDFTextStrings(content string) string {
+	literalRe := regexp.MustCompile(`\((?:\\.|[^\\)])*\)`)
+	matches := literalRe.FindAllString(content, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(matches))
+	for _, match := range matches {
+		text := unescapePDFLiteral(match[1 : len(match)-1])
+		if strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func unescapePDFLiteral(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 >= len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		i++
+		switch s[i] {
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'b', 'f':
+			b.WriteByte(' ')
+		case '(', ')', '\\':
+			b.WriteByte(s[i])
+		case '\n':
+			continue
+		case '\r':
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i++
+			}
+		default:
+			if s[i] >= '0' && s[i] <= '7' {
+				value := int(s[i] - '0')
+				consumed := 0
+				for i+1 < len(s) && consumed < 2 && s[i+1] >= '0' && s[i+1] <= '7' {
+					i++
+					consumed++
+					value = value*8 + int(s[i]-'0')
+				}
+				b.WriteByte(byte(value))
+			} else {
+				b.WriteByte(s[i])
+			}
+		}
+	}
+	return b.String()
+}
+
+func firstMapString(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func extractToolResultContent(content interface{}) (string, []KiroImage) {
@@ -1046,10 +1344,11 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 
 	for _, tu := range toolUses {
 		blocks = append(blocks, ClaudeContentBlock{
-			Type:  "tool_use",
-			ID:    tu.ToolUseID,
-			Name:  tu.Name,
-			Input: tu.Input,
+			Type:   "tool_use",
+			ID:     tu.ToolUseID,
+			Name:   tu.Name,
+			Input:  tu.Input,
+			Caller: map[string]string{"type": "direct"},
 		})
 	}
 
@@ -1068,6 +1367,12 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 		Usage: ClaudeUsage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
+			OutputTokensDetails: map[string]int{
+				"thinking_tokens": estimateApproxTokens(thinkingContent),
+			},
+		},
+		ContextManagement: map[string]interface{}{
+			"applied_edits": []interface{}{},
 		},
 	}
 }
