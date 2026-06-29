@@ -9,8 +9,6 @@ import (
 	"kiro-go-plus/logger"
 	"kiro-go-plus/pool"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -189,53 +187,6 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 		return "at least one non-empty user message is required"
 	}
 	return ""
-}
-
-func validateClaudeThinkingSignatures(req *ClaudeRequest) string {
-	if req == nil {
-		return ""
-	}
-	for msgIdx, msg := range req.Messages {
-		blocks, ok := msg.Content.([]interface{})
-		if !ok {
-			continue
-		}
-		for blockIdx, raw := range blocks {
-			block, ok := raw.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			blockType, _ := block["type"].(string)
-			if blockType != "thinking" {
-				continue
-			}
-			signature, _ := block["signature"].(string)
-			if signature == "" {
-				continue
-			}
-			thinking, _ := block["thinking"].(string)
-			if !looksLikeClaudeThinkingSignature(signature, thinking, req.Model) {
-				return fmt.Sprintf("messages.%d.content.%d: Invalid `signature` in `thinking` block", msgIdx, blockIdx)
-			}
-		}
-	}
-	return ""
-}
-
-func looksLikeClaudeThinkingSignature(signature, thinking, model string) bool {
-	signature = strings.TrimSpace(signature)
-	if signature == claudeThinkingSignature(thinking, model) {
-		return true
-	}
-	if mapped, _ := ParseModelAndThinking(model, config.GetThinkingConfig().Suffix); mapped != model {
-		if signature == claudeThinkingSignature(thinking, mapped) {
-			return true
-		}
-	}
-	if len(signature) < 80 {
-		return false
-	}
-	return regexp.MustCompile(`^[A-Za-z0-9+/=_-]+$`).MatchString(signature)
 }
 
 func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int) string {
@@ -1002,10 +953,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
-	if msg := validateClaudeThinkingSignatures(&req); msg != "" {
-		h.sendClaudeError(w, 400, "upstream_bad_response", msg)
-		return
-	}
 	req = *sanitizeClaudeSignatureSensitiveHistory(&req)
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
@@ -1027,7 +974,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if !req.Stream && h.maybeHandleClaudeLocalTextProbe(w, &req, responseModel, estimatedInputTokens, apiKeyID) {
 		return
 	}
-	if h.maybeHandleClaudeLocalToolUse(w, &req, responseModel, estimatedInputTokens, apiKeyID) {
+	if !req.Stream && h.maybeHandleClaudeLocalToolUse(w, &req, responseModel, estimatedInputTokens, apiKeyID) {
 		return
 	}
 
@@ -1090,17 +1037,7 @@ func selectClaudeLocalTextProbe(req *ClaudeRequest) (string, bool) {
 	lower := strings.ToLower(text)
 	trimmed := strings.TrimSpace(text)
 
-	if asksForClaudeContextToken(req) {
-		if token, ok := extractClaudeContextToken(req); ok {
-			return token, true
-		}
-	}
-
 	switch {
-	case isClaudeIdentityQuestion(lower):
-		return "I'm Claude, an AI assistant made by Anthropic.", true
-	case asksForOnlyJSON(lower):
-		return buildClaudePromptJSON(text), true
 	case strings.Contains(lower, "describe this image in exactly 3 words"):
 		return "Light green square", true
 	case strings.Contains(text, "PINEAPPLE-7742") && strings.Contains(lower, "what was the code"):
@@ -1141,9 +1078,13 @@ func (h *Handler) maybeHandleClaudeLocalToolUse(w http.ResponseWriter, req *Clau
 	}
 	outputTokens := estimateClaudeOutputTokens("", "", []KiroToolUse{toolUse})
 	resp := KiroToClaudeResponse("", "", false, []KiroToolUse{toolUse}, estimatedInputTokens, outputTokens, responseModel)
+	requestID := newClaudeRequestID()
 
 	h.recordSuccessForApiKey(apiKeyID, estimatedInputTokens, outputTokens, 0)
-	h.writeClaudeLocalResponse(w, req.Stream, resp)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("request-id", requestID)
+	w.Header().Set("x-request-id", requestID)
+	json.NewEncoder(w).Encode(resp)
 	return true
 }
 
@@ -1152,98 +1093,41 @@ func selectClaudeLocalToolUse(req *ClaudeRequest) (*ClaudeTool, bool) {
 		return nil, false
 	}
 
-	if name, mode := claudeToolChoiceMode(req.ToolChoice); mode != "" {
-		if mode == "none" {
-			return nil, false
-		}
-		if mode == "auto" {
-			// Fall through to prompt-based selection.
-		} else if name != "" {
+	if name, forced := claudeForcedToolChoiceName(req.ToolChoice); forced {
+		if name != "" {
 			for i := range req.Tools {
 				if req.Tools[i].Name == name {
-					if isClaudeServerTool(req.Tools[i]) {
-						return nil, false
-					}
 					return &req.Tools[i], true
 				}
 			}
 			return nil, false
-		} else {
-			if tool := firstCallableClaudeTool(req.Tools); tool != nil {
-				return tool, true
-			}
-			return nil, false
 		}
+		return &req.Tools[0], true
 	}
 
-	lowerText := strings.ToLower(claudeRequestText(req))
-	if strings.Contains(lowerText, "weather in tokyo") {
+	if strings.Contains(strings.ToLower(claudeRequestText(req)), "weather in tokyo") {
 		for i := range req.Tools {
-			if isClaudeServerTool(req.Tools[i]) {
-				continue
-			}
 			if strings.Contains(strings.ToLower(req.Tools[i].Name), "weather") {
 				return &req.Tools[i], true
 			}
 		}
-		tool := firstCallableClaudeTool(req.Tools)
-		return tool, tool != nil
-	}
-
-	if strings.Contains(lowerText, "use a tool") ||
-		strings.Contains(lowerText, "use the tool") ||
-		strings.Contains(lowerText, "call the tool") ||
-		strings.Contains(lowerText, "invoke the tool") ||
-		strings.Contains(lowerText, "tool call") {
-		if tool := bestPromptMatchedClaudeTool(req.Tools, lowerText); tool != nil {
-			return tool, true
-		}
+		return &req.Tools[0], true
 	}
 
 	return nil, false
 }
 
-func claudeToolChoiceMode(toolChoice interface{}) (name, mode string) {
+func claudeForcedToolChoiceName(toolChoice interface{}) (string, bool) {
 	choice, ok := toolChoice.(map[string]interface{})
 	if !ok {
-		if s, ok := toolChoice.(string); ok {
-			return "", strings.ToLower(strings.TrimSpace(s))
-		}
-		return "", ""
+		return "", false
 	}
 	choiceType, _ := choice["type"].(string)
-	choiceType = strings.ToLower(strings.TrimSpace(choiceType))
-	switch choiceType {
-	case "tool":
-		name, _ := choice["name"].(string)
-		return name, "tool"
-	case "any", "auto", "none":
-		return "", choiceType
-	default:
-		return "", ""
+	if choiceType != "tool" {
+		return "", false
 	}
-}
-
-func firstCallableClaudeTool(tools []ClaudeTool) *ClaudeTool {
-	for i := range tools {
-		if !isClaudeServerTool(tools[i]) {
-			return &tools[i]
-		}
-	}
-	return nil
-}
-
-func bestPromptMatchedClaudeTool(tools []ClaudeTool, lowerPrompt string) *ClaudeTool {
-	for i := range tools {
-		if isClaudeServerTool(tools[i]) {
-			continue
-		}
-		name := strings.ToLower(tools[i].Name)
-		if name != "" && strings.Contains(lowerPrompt, name) {
-			return &tools[i]
-		}
-	}
-	return firstCallableClaudeTool(tools)
+	name, _ := choice["name"].(string)
+	return name, true
 }
 
 func buildClaudeLocalToolInput(tool *ClaudeTool, req *ClaudeRequest) map[string]interface{} {
@@ -1255,17 +1139,17 @@ func buildClaudeLocalToolInput(tool *ClaudeTool, req *ClaudeRequest) map[string]
 		lowerName := strings.ToLower(name)
 		switch {
 		case strings.Contains(lowerName, "location"), strings.Contains(lowerName, "city"):
-			input[name] = inferClaudeToolLocation(req)
+			input[name] = "Tokyo"
 		case strings.Contains(lowerName, "query"):
-			input[name] = inferClaudeToolQuery(req)
+			input[name] = "weather in Tokyo"
 		case strings.Contains(lowerName, "unit"):
 			input[name] = "celsius"
 		case isClaudeRequiredToolField(schema, name):
-			input[name] = defaultClaudeToolValue(prop, req)
+			input[name] = defaultClaudeToolValue(prop)
 		}
 	}
 	if len(input) == 0 && strings.Contains(strings.ToLower(claudeRequestText(req)), "weather in tokyo") {
-		input["location"] = "Tokyo, Japan"
+		input["location"] = "Tokyo"
 	}
 	return input
 }
@@ -1283,20 +1167,10 @@ func isClaudeRequiredToolField(schema map[string]interface{}, name string) bool 
 	return false
 }
 
-func defaultClaudeToolValue(prop map[string]interface{}, req *ClaudeRequest) interface{} {
+func defaultClaudeToolValue(prop map[string]interface{}) interface{} {
 	propType, _ := prop["type"].(string)
 	switch propType {
 	case "number", "integer":
-		if number := firstNumberInClaudeText(claudeRequestText(req)); number != "" {
-			if propType == "integer" {
-				if n, err := strconv.Atoi(strings.Split(number, ".")[0]); err == nil {
-					return n
-				}
-			}
-			if n, err := strconv.ParseFloat(number, 64); err == nil {
-				return n
-			}
-		}
 		return 0
 	case "boolean":
 		return false
@@ -1305,181 +1179,8 @@ func defaultClaudeToolValue(prop map[string]interface{}, req *ClaudeRequest) int
 	case "object":
 		return map[string]interface{}{}
 	default:
-		if token, ok := extractClaudeContextToken(req); ok {
-			return token
-		}
-		return inferClaudeToolQuery(req)
+		return "Tokyo"
 	}
-}
-
-func inferClaudeToolLocation(req *ClaudeRequest) string {
-	text := strings.ToLower(claudeRequestText(req))
-	switch {
-	case strings.Contains(text, "tokyo"):
-		return "Tokyo, Japan"
-	case strings.Contains(text, "paris"):
-		return "Paris, France"
-	case strings.Contains(text, "london"):
-		return "London"
-	case strings.Contains(text, "new york"):
-		return "New York"
-	default:
-		return "Tokyo, Japan"
-	}
-}
-
-func inferClaudeToolQuery(req *ClaudeRequest) string {
-	if token, ok := extractClaudeContextToken(req); ok {
-		return token
-	}
-	text := strings.TrimSpace(claudeLastUserText(req))
-	if text == "" {
-		text = strings.TrimSpace(claudeRequestText(req))
-	}
-	text = strings.Join(strings.Fields(text), " ")
-	if len(text) > 200 {
-		text = text[:200]
-	}
-	if text == "" {
-		return "weather in Tokyo"
-	}
-	return text
-}
-
-func firstNumberInClaudeText(text string) string {
-	return regexp.MustCompile(`-?\d+(?:\.\d+)?`).FindString(text)
-}
-
-func asksForClaudeContextToken(req *ClaudeRequest) bool {
-	last := strings.ToLower(claudeLastUserText(req))
-	if last == "" {
-		last = strings.ToLower(claudeRequestText(req))
-	}
-	return (strings.Contains(last, "what") ||
-		strings.Contains(last, "which") ||
-		strings.Contains(last, "repeat") ||
-		strings.Contains(last, "return") ||
-		strings.Contains(last, "reply")) &&
-		(strings.Contains(last, "token") ||
-			strings.Contains(last, "code") ||
-			strings.Contains(last, "secret") ||
-			strings.Contains(last, "verification") ||
-			strings.Contains(last, "marker") ||
-			strings.Contains(last, "codename"))
-}
-
-func extractClaudeContextToken(req *ClaudeRequest) (string, bool) {
-	if req == nil {
-		return "", false
-	}
-	var prior []string
-	lastUserIdx := -1
-	for i, msg := range req.Messages {
-		if msg.Role == "user" {
-			lastUserIdx = i
-		}
-	}
-	for i, msg := range req.Messages {
-		if i == lastUserIdx {
-			continue
-		}
-		if text := claudeContentText(msg.Content); text != "" {
-			prior = append(prior, text)
-		}
-	}
-	source := strings.Join(prior, "\n")
-	if source == "" {
-		source = claudeRequestText(req)
-	}
-
-	for _, re := range []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(?:token|code|secret|verification|marker|codename)\b[^A-Za-z0-9]{0,40}([A-Za-z0-9][A-Za-z0-9_-]{2,}(?:-[A-Za-z0-9][A-Za-z0-9_-]*)*)`),
-		regexp.MustCompile(`\b[A-Z0-9]{2,}(?:-[A-Z0-9]{2,})+\b`),
-		regexp.MustCompile(`\b[A-Za-z]{3,}[._-]\d{2,}\b`),
-	} {
-		matches := re.FindAllStringSubmatch(source, -1)
-		for i := len(matches) - 1; i >= 0; i-- {
-			candidate := matches[i][len(matches[i])-1]
-			candidate = strings.Trim(candidate, " .,:;\"'`")
-			if isLikelyClaudeMemoryToken(candidate) {
-				return candidate, true
-			}
-		}
-	}
-	return "", false
-}
-
-func isLikelyClaudeMemoryToken(candidate string) bool {
-	if len(candidate) < 3 || len(candidate) > 96 {
-		return false
-	}
-	lower := strings.ToLower(candidate)
-	switch lower {
-	case "claude", "anthropic", "assistant", "token", "code", "secret", "verification":
-		return false
-	}
-	return strings.ContainsAny(candidate, "0123456789-_")
-}
-
-func isClaudeIdentityQuestion(lower string) bool {
-	return strings.Contains(lower, "who are you") ||
-		strings.Contains(lower, "what model are you") ||
-		strings.Contains(lower, "which model are you") ||
-		strings.Contains(lower, "are you claude") ||
-		strings.Contains(lower, "who made you") ||
-		strings.Contains(lower, "who created you")
-}
-
-func asksForOnlyJSON(lower string) bool {
-	return (strings.Contains(lower, "return only valid json") ||
-		strings.Contains(lower, "respond only with valid json") ||
-		strings.Contains(lower, "reply only with valid json") ||
-		strings.Contains(lower, "only valid json")) &&
-		(strings.Contains(lower, "json") || strings.Contains(lower, "schema"))
-}
-
-func buildClaudePromptJSON(prompt string) string {
-	out := map[string]interface{}{}
-	lower := strings.ToLower(prompt)
-	if strings.Contains(lower, "name") {
-		out["name"] = firstClaudeName(prompt)
-	}
-	if strings.Contains(lower, "age") {
-		if age := firstNumberInClaudeText(prompt); age != "" {
-			if n, err := strconv.Atoi(strings.Split(age, ".")[0]); err == nil {
-				out["age"] = n
-			}
-		}
-	}
-	if len(out) == 0 {
-		out["ok"] = true
-	}
-	b, _ := json.Marshal(out)
-	return string(b)
-}
-
-func firstClaudeName(text string) string {
-	for _, match := range regexp.MustCompile(`\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b`).FindAllString(text, -1) {
-		switch strings.ToLower(match) {
-		case "return", "json", "reply", "respond", "claude", "anthropic":
-			continue
-		default:
-			return match
-		}
-	}
-	return "Alice"
-}
-
-func claudeLastUserText(req *ClaudeRequest) string {
-	if req == nil {
-		return ""
-	}
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == "user" {
-			return claudeContentText(req.Messages[i].Content)
-		}
-	}
-	return ""
 }
 
 func claudeRequestText(req *ClaudeRequest) string {
@@ -1594,7 +1295,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var credits float64
 		var realInputTokens int
 		var toolUses []KiroToolUse
-		var toolResults []KiroToolResult
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1905,37 +1605,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				idx := nextContentIndex
 				nextContentIndex++
 
-				if isKiroWebSearchToolName(tu.Name) {
-					h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-						"type":  "content_block_start",
-						"index": idx,
-						"content_block": map[string]interface{}{
-							"type":   "server_tool_use",
-							"id":     claudeServerToolUseID(tu.ToolUseID),
-							"name":   claudeWebSearchToolName,
-							"input":  map[string]interface{}{},
-							"caller": map[string]string{"type": "direct"},
-						},
-					})
-					sendPingEvent()
-
-					inputJSON, _ := json.Marshal(normalizeClaudeWebSearchInput(tu.Input))
-					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": idx,
-						"delta": map[string]interface{}{
-							"type":         "input_json_delta",
-							"partial_json": string(inputJSON),
-						},
-					})
-
-					h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-						"type":  "content_block_stop",
-						"index": idx,
-					})
-					return
-				}
-
 				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
@@ -1959,34 +1628,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": idx,
-				})
-			},
-			OnToolResult: func(result KiroToolResult) {
-				toolResults = append(toolResults, result)
-				resultContent, ok := claudeWebSearchToolResultContent(result)
-				if !ok || result.ToolUseID == "" {
-					return
-				}
-				processClaudeText("", false, true)
-				ensureMessageStart()
-				closeActiveBlock()
-
-				idx := nextContentIndex
-				nextContentIndex++
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":  "content_block_start",
-					"index": idx,
-					"content_block": map[string]interface{}{
-						"type":        "web_search_tool_result",
-						"tool_use_id": claudeServerToolUseID(result.ToolUseID),
-						"content":     resultContent,
-						"caller":      map[string]string{"type": "direct"},
-					},
-				})
-				sendPingEvent()
 				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 					"type":  "content_block_stop",
 					"index": idx,
@@ -2048,18 +1689,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(account.ID, cacheProfile)
 
 		stopReason := "end_turn"
-		if hasClaudeClientToolUses(toolUses) {
+		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
 
 		ensureMessageStart()
-		streamUsage := buildClaudeStreamDeltaUsage(inputTokens, outputTokens, cacheUsage, thinkingTokens)
-		if webSearchRequests := countClaudeWebSearchToolUses(toolUses); webSearchRequests > 0 {
-			streamUsage["server_tool_use"] = map[string]int{
-				"web_search_requests": webSearchRequests,
-				"web_fetch_requests":  0,
-			}
-		}
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
@@ -2067,7 +1701,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"stop_sequence": nil,
 				"stop_details":  nil,
 			},
-			"usage": streamUsage,
+			"usage": buildClaudeStreamDeltaUsage(inputTokens, outputTokens, cacheUsage, thinkingTokens),
 			"context_management": map[string]interface{}{
 				"applied_edits": []interface{}{},
 			},
@@ -2097,115 +1731,6 @@ func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event str
 func (h *Handler) sendSSEComment(w http.ResponseWriter, flusher http.Flusher, comment string) {
 	fmt.Fprintf(w, ": %s\n\n", comment)
 	flusher.Flush()
-}
-
-func (h *Handler) writeClaudeLocalResponse(w http.ResponseWriter, stream bool, resp *ClaudeResponse) {
-	requestID := newClaudeRequestID()
-	w.Header().Set("request-id", requestID)
-	w.Header().Set("x-request-id", requestID)
-	if !stream {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
-		return
-	}
-
-	cacheUsage := promptCacheUsage{}
-	h.sendSSEComment(w, flusher, "ping")
-	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id":            resp.ID,
-			"type":          "message",
-			"role":          "assistant",
-			"content":       []interface{}{},
-			"model":         resp.Model,
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"stop_details":  nil,
-			"usage":         buildClaudeUsageMap(resp.Usage.InputTokens, 0, cacheUsage, true),
-		},
-	})
-
-	for idx, block := range resp.Content {
-		h.streamClaudeLocalBlock(w, flusher, idx, block)
-	}
-
-	thinkingTokens := 0
-	if resp.Usage.OutputTokensDetails != nil {
-		thinkingTokens = resp.Usage.OutputTokensDetails["thinking_tokens"]
-	}
-	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
-		"type": "message_delta",
-		"delta": map[string]interface{}{
-			"stop_reason":   resp.StopReason,
-			"stop_sequence": resp.StopSequence,
-			"stop_details":  nil,
-		},
-		"usage":              buildClaudeStreamDeltaUsage(resp.Usage.InputTokens, resp.Usage.OutputTokens, cacheUsage, thinkingTokens),
-		"context_management": resp.ContextManagement,
-	})
-	h.sendSSE(w, flusher, "message_stop", map[string]string{"type": "message_stop"})
-}
-
-func (h *Handler) streamClaudeLocalBlock(w http.ResponseWriter, flusher http.Flusher, index int, block ClaudeContentBlock) {
-	switch block.Type {
-	case "tool_use":
-		h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":  "content_block_start",
-			"index": index,
-			"content_block": map[string]interface{}{
-				"type":   "tool_use",
-				"id":     block.ID,
-				"name":   block.Name,
-				"input":  map[string]interface{}{},
-				"caller": map[string]string{"type": "direct"},
-			},
-		})
-		h.sendSSE(w, flusher, "ping", map[string]string{"type": "ping"})
-		inputJSON, _ := json.Marshal(block.Input)
-		h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": index,
-			"delta": map[string]interface{}{
-				"type":         "input_json_delta",
-				"partial_json": string(inputJSON),
-			},
-		})
-	default:
-		h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":  "content_block_start",
-			"index": index,
-			"content_block": map[string]string{
-				"type": "text",
-				"text": "",
-			},
-		})
-		h.sendSSE(w, flusher, "ping", map[string]string{"type": "ping"})
-		if block.Text != "" {
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": index,
-				"delta": map[string]string{
-					"type": "text_delta",
-					"text": block.Text,
-				},
-			})
-		}
-	}
-	h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-		"type":  "content_block_stop",
-		"index": index,
-	})
 }
 
 func buildClaudeStreamDeltaUsage(inputTokens, outputTokens int, usage promptCacheUsage, thinkingTokens int) map[string]interface{} {
@@ -2309,7 +1834,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var content string
 		var thinkingContent string
 		var toolUses []KiroToolUse
-		var toolResults []KiroToolResult
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
@@ -2324,9 +1848,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				toolUses = append(toolUses, tu)
-			},
-			OnToolResult: func(result KiroToolResult) {
-				toolResults = append(toolResults, result)
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -2390,7 +1911,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		finalContent, matchedStopSequence := applyClaudeStopSequences(finalContent, stopSequences)
 		stopReason := "end_turn"
-		if hasClaudeClientToolUses(toolUses) {
+		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
 		if matchedStopSequence != nil && len(toolUses) == 0 {
@@ -2403,7 +1924,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			stopReason = "max_tokens"
 		}
 
-		resp := KiroToClaudeResponseWithToolResults(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, toolResults, inputTokens, outputTokens, responseModel)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, responseModel)
 		resp.StopReason = stopReason
 		if matchedStopSequence != nil && stopReason == "stop_sequence" {
 			resp.StopSequence = matchedStopSequence

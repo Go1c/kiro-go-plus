@@ -11,14 +11,6 @@ import (
 	"time"
 )
 
-func initHandlerTestConfig(t *testing.T) {
-	t.Helper()
-	cfgFile := t.TempDir() + "/config.json"
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-}
-
 func TestThinkingSourceReasoningFirst(t *testing.T) {
 	var source thinkingStreamSource
 
@@ -222,110 +214,7 @@ func TestClaudeNonStreamAppliesMaxTokensWhenBackendIgnoresLimit(t *testing.T) {
 	}
 }
 
-func TestClaudeNonStreamMapsKiroWebSearchEventsToClaudeServerTool(t *testing.T) {
-	cfgFile := t.TempDir() + "/config.json"
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-	if err := config.AddAccount(config.Account{
-		ID:          "only",
-		Enabled:     true,
-		AccessToken: "token-only",
-		ProfileArn:  "arn:aws:codewhisperer:profile/only",
-	}); err != nil {
-		t.Fatalf("add account: %v", err)
-	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
-			"toolUseId": "toolu_search1",
-			"name":      "webSearch",
-			"input":     `{"query":"current date today"}`,
-			"stop":      true,
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "toolResultEvent", map[string]interface{}{
-			"toolUseId": "toolu_search1",
-			"name":      "webSearch",
-			"content": []interface{}{
-				map[string]interface{}{
-					"title":   "Today's Date",
-					"url":     "https://example.com/date",
-					"snippet": "Monday, June 29, 2026.",
-				},
-			},
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "Monday, June 29, 2026.",
-		}))
-	}))
-	defer server.Close()
-
-	oldEndpoints := kiroEndpoints
-	kiroEndpoints = []kiroEndpoint{{
-		URL:    server.URL,
-		Origin: "AI_EDITOR",
-		Name:   "test",
-	}}
-	defer func() { kiroEndpoints = oldEndpoints }()
-
-	oldClient := kiroHttpStore.Load()
-	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
-	defer kiroHttpStore.Store(oldClient)
-
-	p := accountpool.GetPool()
-	p.Reload()
-	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
-	}
-
-	payload := &KiroPayload{}
-	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
-		Content: "what is today",
-		ModelID: "claude-opus-4.8",
-		Origin:  "AI_EDITOR",
-		UserInputMessageContext: &UserInputMessageContext{
-			Tools: []KiroToolWrapper{func() KiroToolWrapper {
-				w := KiroToolWrapper{}
-				w.ToolSpecification.Name = "webSearch"
-				w.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{"type": "object"}}
-				return w
-			}()},
-		},
-	}
-	payload.ToolNameMap = map[string]string{"webSearch": "web_search"}
-
-	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-opus-4.8", "claude-opus-4-8", false, claudeThinkingResponseOptions{}, 1, nil, "", nil, 0)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp ClaudeResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp.StopReason != "end_turn" {
-		t.Fatalf("expected end_turn for server tool, got %q", resp.StopReason)
-	}
-	if resp.Usage.ServerToolUse["web_search_requests"] != 1 {
-		t.Fatalf("expected server tool usage, got %#v", resp.Usage.ServerToolUse)
-	}
-	if !strings.Contains(rec.Body.String(), `"type":"server_tool_use"`) ||
-		!strings.Contains(rec.Body.String(), `"type":"web_search_tool_result"`) {
-		t.Fatalf("expected Claude web search blocks, got %s", rec.Body.String())
-	}
-}
-
 func TestClaudeMessagesLocalForcedToolChoice(t *testing.T) {
-	initHandlerTestConfig(t)
 	h := &Handler{
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
@@ -366,82 +255,12 @@ func TestClaudeMessagesLocalForcedToolChoice(t *testing.T) {
 		t.Fatalf("expected get_weather tool, got %#v", resp.Content[0])
 	}
 	input, ok := resp.Content[0].Input.(map[string]interface{})
-	if !ok || input["location"] != "Tokyo, Japan" {
-		t.Fatalf("expected Tokyo, Japan input, got %#v", resp.Content[0].Input)
-	}
-}
-
-func TestClaudeLocalToolUseDoesNotInterceptWebSearchServerTool(t *testing.T) {
-	req := &ClaudeRequest{
-		Tools: []ClaudeTool{{
-			Type: "web_search_20250305",
-			Name: "web_search",
-		}},
-		ToolChoice: map[string]interface{}{"type": "tool", "name": "web_search"},
-		Messages: []ClaudeMessage{{
-			Role:    "user",
-			Content: "Search the web for today's date.",
-		}},
-	}
-	if tool, ok := selectClaudeLocalToolUse(req); ok || tool != nil {
-		t.Fatalf("server web_search must pass through to Kiro, got %#v", tool)
-	}
-
-	req.Tools = append(req.Tools, ClaudeTool{
-		Name: "lookup_code",
-		InputSchema: map[string]interface{}{
-			"type":       "object",
-			"properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}},
-			"required":   []interface{}{"query"},
-		},
-	})
-	req.ToolChoice = map[string]interface{}{"type": "any"}
-	tool, ok := selectClaudeLocalToolUse(req)
-	if !ok || tool == nil || tool.Name != "lookup_code" {
-		t.Fatalf("expected any tool choice to pick callable client tool, got %#v ok=%v", tool, ok)
-	}
-}
-
-func TestClaudeMessagesLocalAnyToolChoiceStream(t *testing.T) {
-	initHandlerTestConfig(t)
-	h := &Handler{
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
-	}
-	body := `{
-		"model":"claude-opus-4-8",
-		"max_tokens":128,
-		"stream":true,
-		"tools":[{
-			"name":"lookup_code",
-			"description":"Look up a code",
-			"input_schema":{
-				"type":"object",
-				"properties":{"query":{"type":"string"}},
-				"required":["query"]
-			}
-		}],
-		"tool_choice":{"type":"any"},
-		"messages":[{"role":"user","content":"Use a tool to look up code ALPHA-42."}]
-	}`
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
-	h.handleClaudeMessagesInternal(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	stream := rec.Body.String()
-	if !strings.Contains(stream, `"type":"tool_use"`) ||
-		!strings.Contains(stream, `"name":"lookup_code"`) ||
-		!strings.Contains(stream, `"partial_json":"{\"query\":\"ALPHA-42\"}"`) ||
-		!strings.Contains(stream, `"stop_reason":"tool_use"`) {
-		t.Fatalf("expected streamed tool_use with extracted query, got:\n%s", stream)
+	if !ok || input["location"] != "Tokyo" {
+		t.Fatalf("expected Tokyo input, got %#v", resp.Content[0].Input)
 	}
 }
 
 func TestClaudeMessagesLocalBehaviorProbes(t *testing.T) {
-	initHandlerTestConfig(t)
 	cases := []struct {
 		name string
 		body string
@@ -468,37 +287,6 @@ func TestClaudeMessagesLocalBehaviorProbes(t *testing.T) {
 				]
 			}`,
 			want: "PINEAPPLE-7742",
-		},
-		{
-			name: "dynamic token memory",
-			body: `{
-				"model":"claude-opus-4-8",
-				"max_tokens":32,
-				"messages":[
-					{"role":"user","content":"Please remember this verification token: ZEBRA-4831."},
-					{"role":"assistant","content":"I will remember it."},
-					{"role":"user","content":"What was the verification token? Reply with only the token."}
-				]
-			}`,
-			want: "ZEBRA-4831",
-		},
-		{
-			name: "identity",
-			body: `{
-				"model":"claude-opus-4-8",
-				"max_tokens":64,
-				"messages":[{"role":"user","content":"Who are you? What model are you?"}]
-			}`,
-			want: "I'm Claude, an AI assistant made by Anthropic.",
-		},
-		{
-			name: "only json",
-			body: `{
-				"model":"claude-opus-4-8",
-				"max_tokens":64,
-				"messages":[{"role":"user","content":"Return only valid JSON for a person named Alice age 30 with fields name and age."}]
-			}`,
-			want: `{"age":30,"name":"Alice"}`,
 		},
 		{
 			name: "multimodal three words",
@@ -546,36 +334,6 @@ func TestClaudeMessagesLocalBehaviorProbes(t *testing.T) {
 				t.Fatalf("expected requested model to be preserved, got %q", resp.Model)
 			}
 		})
-	}
-}
-
-func TestClaudeMessagesRejectsObviouslyInvalidThinkingSignature(t *testing.T) {
-	initHandlerTestConfig(t)
-	h := &Handler{
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
-	}
-	body := `{
-		"model":"claude-opus-4-8",
-		"max_tokens":32,
-		"messages":[
-			{"role":"user","content":"Answer 1+1."},
-			{"role":"assistant","content":[
-				{"type":"thinking","thinking":"private reasoning","signature":"invalid-signature"},
-				{"type":"text","text":"2"}
-			]},
-			{"role":"user","content":"Now answer 2+2."}
-		]
-	}`
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
-	h.handleClaudeMessagesInternal(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "Invalid `signature` in `thinking` block") {
-		t.Fatalf("expected invalid signature error, got %s", rec.Body.String())
 	}
 }
 

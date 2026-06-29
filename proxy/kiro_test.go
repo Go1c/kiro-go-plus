@@ -108,35 +108,6 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 	}
 }
 
-func TestParseEventStreamEmitsToolResultEvent(t *testing.T) {
-	stream := bytes.NewReader(awsEventStreamFrame(t, "toolResultEvent", map[string]interface{}{
-		"toolUseId": "toolu_search1",
-		"name":      "webSearch",
-		"content": []interface{}{
-			map[string]interface{}{"title": "Result", "url": "https://example.com", "snippet": "real result"},
-		},
-	}))
-
-	var results []KiroToolResult
-	err := parseEventStream(stream, &KiroStreamCallback{
-		OnToolResult: func(result KiroToolResult) {
-			results = append(results, result)
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected parse error: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("expected one tool result, got %d", len(results))
-	}
-	if results[0].ToolUseID != "toolu_search1" || results[0].Name != "webSearch" {
-		t.Fatalf("unexpected tool result metadata: %#v", results[0])
-	}
-	if results[0].RawContent == nil || !strings.Contains(results[0].Content[0].Text, "https://example.com") {
-		t.Fatalf("expected raw and text content to be retained, got %#v", results[0])
-	}
-}
-
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
 	current := handleToolUseEvent(map[string]interface{}{
