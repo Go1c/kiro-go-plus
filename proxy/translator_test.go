@@ -479,6 +479,91 @@ func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeToolsMapsWebSearchServerToolToKiroWebSearch(t *testing.T) {
+	tools, nameMap := convertClaudeTools([]ClaudeTool{{
+		Type:    "web_search_20250305",
+		Name:    "web_search",
+		MaxUses: 2,
+	}})
+
+	if len(tools) != 1 {
+		t.Fatalf("expected one converted tool, got %d", len(tools))
+	}
+	if got := tools[0].ToolSpecification.Name; got != "webSearch" {
+		t.Fatalf("expected Kiro webSearch tool name, got %q", got)
+	}
+	if nameMap["webSearch"] != "web_search" {
+		t.Fatalf("expected webSearch to map back to Claude web_search, got %#v", nameMap)
+	}
+	schema, ok := tools[0].ToolSpecification.InputSchema.JSON.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected object schema, got %#v", tools[0].ToolSpecification.InputSchema.JSON)
+	}
+	if schema["type"] != "object" {
+		t.Fatalf("expected object schema, got %#v", schema)
+	}
+}
+
+func TestKiroToClaudeResponseMapsWebSearchToServerToolUse(t *testing.T) {
+	resp := KiroToClaudeResponseWithToolResults(
+		"Search-backed answer.",
+		"",
+		false,
+		[]KiroToolUse{{
+			ToolUseID: "toolu_search1",
+			Name:      "webSearch",
+			Input:     map[string]interface{}{"query": "current date today"},
+		}},
+		[]KiroToolResult{{
+			ToolUseID: "toolu_search1",
+			RawContent: []interface{}{
+				map[string]interface{}{
+					"title":   "Today's Date",
+					"url":     "https://example.com/date",
+					"snippet": "Today is Monday, June 29, 2026.",
+				},
+			},
+			Status: "success",
+		}},
+		10,
+		20,
+		"claude-opus-4-8",
+	)
+
+	if resp.StopReason != "end_turn" {
+		t.Fatalf("web search server tool must not use client tool stop_reason, got %q", resp.StopReason)
+	}
+	if resp.Usage.ServerToolUse["web_search_requests"] != 1 {
+		t.Fatalf("expected web search usage count, got %#v", resp.Usage.ServerToolUse)
+	}
+	var serverBlock, resultBlock *ClaudeContentBlock
+	for i := range resp.Content {
+		switch resp.Content[i].Type {
+		case "server_tool_use":
+			serverBlock = &resp.Content[i]
+		case "web_search_tool_result":
+			resultBlock = &resp.Content[i]
+		}
+	}
+	if serverBlock == nil {
+		t.Fatalf("expected server_tool_use block, got %#v", resp.Content)
+	}
+	if serverBlock.Name != "web_search" || !strings.HasPrefix(serverBlock.ID, "srvtoolu_") {
+		t.Fatalf("unexpected server tool block: %#v", serverBlock)
+	}
+	if resultBlock == nil {
+		t.Fatalf("expected web_search_tool_result block, got %#v", resp.Content)
+	}
+	results, ok := resultBlock.Content.([]interface{})
+	if !ok || len(results) != 1 {
+		t.Fatalf("expected one normalized search result, got %#v", resultBlock.Content)
+	}
+	first, ok := results[0].(map[string]interface{})
+	if !ok || first["type"] != "web_search_result" || first["page_content"] == "" {
+		t.Fatalf("expected normalized web_search_result, got %#v", results[0])
+	}
+}
+
 func schemaContainsKey(value interface{}, key string) bool {
 	switch v := value.(type) {
 	case map[string]interface{}:

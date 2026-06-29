@@ -49,6 +49,8 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
+const claudeWebSearchToolName = "web_search"
+const kiroWebSearchToolName = "webSearch"
 
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
 // Kiro's upstream rejects oversized requests with HTTP 400
@@ -771,6 +773,10 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 					Content:   []KiroResultContent{{Text: resultContent}},
 					Status:    "success",
 				})
+			case "web_search_tool_result":
+				if resultContent := narrateClaudeWebSearchToolResult(block); resultContent != "" {
+					text = joinHistoryText(text, resultContent)
+				}
 			}
 		}
 	}
@@ -1163,6 +1169,19 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 					Name:      name,
 					Input:     input,
 				})
+			case "server_tool_use":
+				name, _ := block["name"].(string)
+				if isClaudeWebSearchToolName(name) {
+					if input, _ := block["input"].(map[string]interface{}); input != nil {
+						if query, _ := input["query"].(string); strings.TrimSpace(query) != "" {
+							text = joinHistoryText(text, "Web search query: "+strings.TrimSpace(query))
+						}
+					}
+				}
+			case "web_search_tool_result":
+				if resultText := narrateClaudeWebSearchToolResult(block); resultText != "" {
+					text = joinHistoryText(text, resultText)
+				}
 			}
 		}
 	}
@@ -1178,6 +1197,25 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
+		if isClaudeServerTool(tool) {
+			w := KiroToolWrapper{}
+			w.ToolSpecification.Name = kiroWebSearchToolName
+			w.ToolSpecification.Description = "Search the web for current or external information relevant to the user's query."
+			w.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"query": map[string]interface{}{
+						"type":        "string",
+						"description": "The web search query.",
+					},
+				},
+				"required": []interface{}{"query"},
+			}}
+			result = append(result, w)
+			nameMap[kiroWebSearchToolName] = claudeWebSearchToolName
+			continue
+		}
+
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
@@ -1322,9 +1360,88 @@ func shortenToolName(name string) string {
 	return name[:64]
 }
 
+func isClaudeServerTool(tool ClaudeTool) bool {
+	name := strings.ToLower(tool.Name)
+	typ := strings.ToLower(tool.Type)
+	return isClaudeWebSearchToolName(name) ||
+		strings.Contains(name, "websearch") ||
+		isClaudeWebSearchToolName(typ) ||
+		strings.Contains(typ, "websearch")
+}
+
+func isClaudeWebSearchToolName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return normalized == claudeWebSearchToolName ||
+		strings.HasPrefix(normalized, "web_search_") ||
+		normalized == "websearch"
+}
+
+func isKiroWebSearchToolName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return normalized == strings.ToLower(kiroWebSearchToolName) ||
+		normalized == claudeWebSearchToolName ||
+		strings.HasPrefix(normalized, "web_search_") ||
+		normalized == "websearch"
+}
+
+func hasClaudeClientToolUses(toolUses []KiroToolUse) bool {
+	for _, tu := range toolUses {
+		if !isKiroWebSearchToolName(tu.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func countClaudeWebSearchToolUses(toolUses []KiroToolUse) int {
+	count := 0
+	for _, tu := range toolUses {
+		if isKiroWebSearchToolName(tu.Name) {
+			count++
+		}
+	}
+	return count
+}
+
+func narrateClaudeWebSearchToolResult(block map[string]interface{}) string {
+	content := block["content"]
+	blocks, ok := normalizeClaudeWebSearchResultBlocks(content)
+	if !ok || len(blocks) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, raw := range blocks {
+		result, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		title := firstMapString(result, "title")
+		url := firstMapString(result, "url")
+		pageContent := firstMapString(result, "page_content", "snippet", "text")
+		switch {
+		case title != "" && url != "" && pageContent != "":
+			parts = append(parts, fmt.Sprintf("%s (%s): %s", title, url, pageContent))
+		case title != "" && url != "":
+			parts = append(parts, fmt.Sprintf("%s (%s)", title, url))
+		case url != "" && pageContent != "":
+			parts = append(parts, fmt.Sprintf("%s: %s", url, pageContent))
+		case pageContent != "":
+			parts = append(parts, pageContent)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Web search results:\n" + strings.Join(parts, "\n")
+}
+
 // ==================== Kiro -> Claude 转换 ====================
 
 func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+	return KiroToClaudeResponseWithToolResults(content, thinkingContent, includeEmptyThinkingBlock, toolUses, nil, inputTokens, outputTokens, model)
+}
+
+func KiroToClaudeResponseWithToolResults(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, toolResults []KiroToolResult, inputTokens, outputTokens int, model string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
@@ -1335,15 +1452,36 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 		})
 	}
 
-	if content != "" {
-		blocks = append(blocks, ClaudeContentBlock{
-			Type: "text",
-			Text: content,
-		})
-	}
-
+	toolResultsByID := indexKiroToolResults(toolResults)
+	clientToolUses := 0
+	webSearchRequests := 0
+	serverToolBlocks := make([]ClaudeContentBlock, 0)
+	clientToolBlocks := make([]ClaudeContentBlock, 0)
 	for _, tu := range toolUses {
-		blocks = append(blocks, ClaudeContentBlock{
+		if isKiroWebSearchToolName(tu.Name) {
+			webSearchRequests++
+			serverToolUseID := claudeServerToolUseID(tu.ToolUseID)
+			serverToolBlocks = append(serverToolBlocks, ClaudeContentBlock{
+				Type:   "server_tool_use",
+				ID:     serverToolUseID,
+				Name:   claudeWebSearchToolName,
+				Input:  normalizeClaudeWebSearchInput(tu.Input),
+				Caller: map[string]string{"type": "direct"},
+			})
+			if result, ok := lookupKiroToolResult(toolResultsByID, tu.ToolUseID, serverToolUseID); ok {
+				if resultContent, ok := claudeWebSearchToolResultContent(result); ok {
+					serverToolBlocks = append(serverToolBlocks, ClaudeContentBlock{
+						Type:      "web_search_tool_result",
+						ToolUseID: serverToolUseID,
+						Content:   resultContent,
+						Caller:    map[string]string{"type": "direct"},
+					})
+				}
+			}
+			continue
+		}
+		clientToolUses++
+		clientToolBlocks = append(clientToolBlocks, ClaudeContentBlock{
 			Type:   "tool_use",
 			ID:     tu.ToolUseID,
 			Name:   tu.Name,
@@ -1351,13 +1489,23 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 			Caller: map[string]string{"type": "direct"},
 		})
 	}
+	if len(serverToolBlocks) > 0 {
+		blocks = append(blocks, serverToolBlocks...)
+	}
+	if content != "" {
+		blocks = append(blocks, ClaudeContentBlock{
+			Type: "text",
+			Text: content,
+		})
+	}
+	blocks = append(blocks, clientToolBlocks...)
 
 	stopReason := "end_turn"
-	if len(toolUses) > 0 {
+	if clientToolUses > 0 {
 		stopReason = "tool_use"
 	}
 
-	return &ClaudeResponse{
+	resp := &ClaudeResponse{
 		ID:         newClaudeMessageID(),
 		Type:       "message",
 		Role:       "assistant",
@@ -1375,6 +1523,144 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 			"applied_edits": []interface{}{},
 		},
 	}
+	if webSearchRequests > 0 {
+		resp.Usage.ServerToolUse = map[string]int{
+			"web_search_requests": webSearchRequests,
+			"web_fetch_requests":  0,
+		}
+	}
+	return resp
+}
+
+func indexKiroToolResults(toolResults []KiroToolResult) map[string]KiroToolResult {
+	if len(toolResults) == 0 {
+		return nil
+	}
+	index := make(map[string]KiroToolResult, len(toolResults)*2)
+	for _, result := range toolResults {
+		if result.ToolUseID == "" {
+			continue
+		}
+		index[result.ToolUseID] = result
+		index[claudeServerToolUseID(result.ToolUseID)] = result
+	}
+	return index
+}
+
+func lookupKiroToolResult(index map[string]KiroToolResult, ids ...string) (KiroToolResult, bool) {
+	for _, id := range ids {
+		if result, ok := index[id]; ok {
+			return result, true
+		}
+	}
+	return KiroToolResult{}, false
+}
+
+func normalizeClaudeWebSearchInput(input map[string]interface{}) map[string]interface{} {
+	if input == nil {
+		return map[string]interface{}{}
+	}
+	if query, ok := input["query"]; ok {
+		return map[string]interface{}{"query": query}
+	}
+	for _, key := range []string{"q", "searchQuery", "search_query", "text"} {
+		if query, ok := input[key]; ok {
+			return map[string]interface{}{"query": query}
+		}
+	}
+	return input
+}
+
+func claudeServerToolUseID(id string) string {
+	id = strings.TrimSpace(id)
+	if strings.HasPrefix(id, "srvtoolu_") {
+		return id
+	}
+	if id == "" {
+		return "srvtoolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	}
+	id = strings.TrimPrefix(id, "toolu_")
+	id = strings.TrimPrefix(id, "tool_")
+	id = strings.ReplaceAll(id, "-", "")
+	return "srvtoolu_" + id
+}
+
+func claudeWebSearchToolResultContent(result KiroToolResult) (interface{}, bool) {
+	if blocks, ok := normalizeClaudeWebSearchResultBlocks(result.RawContent); ok {
+		return blocks, true
+	}
+	for _, content := range result.Content {
+		if blocks, ok := normalizeClaudeWebSearchResultBlocks(content.Text); ok {
+			return blocks, true
+		}
+	}
+	return nil, false
+}
+
+func normalizeClaudeWebSearchResultBlocks(raw interface{}) ([]interface{}, bool) {
+	switch value := raw.(type) {
+	case nil:
+		return nil, false
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, false
+		}
+		var decoded interface{}
+		if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+			return nil, false
+		}
+		return normalizeClaudeWebSearchResultBlocks(decoded)
+	case []interface{}:
+		results := make([]interface{}, 0, len(value))
+		for _, item := range value {
+			if normalized, ok := normalizeClaudeWebSearchResultBlock(item); ok {
+				results = append(results, normalized)
+			} else if nested, ok := normalizeClaudeWebSearchResultBlocks(item); ok {
+				results = append(results, nested...)
+			}
+		}
+		return results, len(results) > 0
+	case map[string]interface{}:
+		if content, ok := value["content"]; ok {
+			if blocks, ok := normalizeClaudeWebSearchResultBlocks(content); ok {
+				return blocks, true
+			}
+		}
+		for _, key := range []string{"results", "searchResults", "search_results", "webSearchResults", "web_search_results"} {
+			if child, ok := value[key]; ok {
+				if blocks, ok := normalizeClaudeWebSearchResultBlocks(child); ok {
+					return blocks, true
+				}
+			}
+		}
+		if normalized, ok := normalizeClaudeWebSearchResultBlock(value); ok {
+			return []interface{}{normalized}, true
+		}
+	}
+	return nil, false
+}
+
+func normalizeClaudeWebSearchResultBlock(raw interface{}) (interface{}, bool) {
+	block, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	blockType, _ := block["type"].(string)
+	hasURL := strings.TrimSpace(firstMapString(block, "url")) != ""
+	hasTitle := strings.TrimSpace(firstMapString(block, "title")) != ""
+	hasContent := strings.TrimSpace(firstMapString(block, "page_content", "snippet", "text")) != ""
+	if blockType != "web_search_result" && !hasURL && !hasTitle {
+		return nil, false
+	}
+	normalized := cloneSchemaMap(block)
+	normalized["type"] = "web_search_result"
+	if _, ok := normalized["page_content"]; !ok {
+		if snippet := firstMapString(block, "snippet", "text"); snippet != "" {
+			normalized["page_content"] = snippet
+		}
+	}
+	return normalized, hasURL || hasTitle || hasContent
 }
 
 func claudeThinkingSignature(thinkingContent, model string) string {

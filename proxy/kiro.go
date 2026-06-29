@@ -191,9 +191,11 @@ type InputSchema struct {
 }
 
 type KiroToolResult struct {
-	ToolUseID string              `json:"toolUseId"`
-	Content   []KiroResultContent `json:"content"`
-	Status    string              `json:"status"`
+	ToolUseID  string              `json:"toolUseId"`
+	Content    []KiroResultContent `json:"content"`
+	Status     string              `json:"status"`
+	Name       string              `json:"-"`
+	RawContent interface{}         `json:"-"`
 }
 
 type KiroResultContent struct {
@@ -235,6 +237,7 @@ type InferenceConfig struct {
 type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
+	OnToolResult   func(result KiroToolResult)
 	OnComplete     func(inputTokens, outputTokens int)
 	OnError        func(err error)
 	OnCredits      func(credits float64)
@@ -308,16 +311,27 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
 	}
 
-	// Wrap OnToolUse to restore original tool names for the client.
-	if callback != nil && callback.OnToolUse != nil && len(payload.ToolNameMap) > 0 {
-		originalOnToolUse := callback.OnToolUse
+	// Wrap callbacks to restore original tool names for the client.
+	if callback != nil && len(payload.ToolNameMap) > 0 {
 		nameMap := payload.ToolNameMap
 		wrapped := *callback
-		wrapped.OnToolUse = func(tu KiroToolUse) {
-			if original, ok := nameMap[tu.Name]; ok {
-				tu.Name = original
+		if callback.OnToolUse != nil {
+			originalOnToolUse := callback.OnToolUse
+			wrapped.OnToolUse = func(tu KiroToolUse) {
+				if original, ok := nameMap[tu.Name]; ok {
+					tu.Name = original
+				}
+				originalOnToolUse(tu)
 			}
-			originalOnToolUse(tu)
+		}
+		if callback.OnToolResult != nil {
+			originalOnToolResult := callback.OnToolResult
+			wrapped.OnToolResult = func(result KiroToolResult) {
+				if original, ok := nameMap[result.Name]; ok {
+					result.Name = original
+				}
+				originalOnToolResult(result)
+			}
 		}
 		callback = &wrapped
 	}
@@ -480,6 +494,8 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 		case "toolUseEvent":
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
+		case "toolResultEvent":
+			handleToolResultEvent(event, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
@@ -505,6 +521,55 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
 	return nil
+}
+
+func handleToolResultEvent(event map[string]interface{}, callback *KiroStreamCallback) {
+	if callback == nil || callback.OnToolResult == nil {
+		return
+	}
+	toolUseID := firstStringField(event, "toolUseId", "toolUseID", "tool_use_id", "id")
+	name := firstStringField(event, "name", "toolName", "tool_name")
+	status := firstStringField(event, "status")
+	if status == "" {
+		status = "success"
+	}
+
+	rawContent := firstPresentField(event,
+		"content", "result", "results", "toolResult", "tool_result",
+		"webSearchResult", "web_search_result", "webSearchResults", "web_search_results",
+	)
+	content := kiroResultContentText(rawContent)
+	callback.OnToolResult(KiroToolResult{
+		ToolUseID:  toolUseID,
+		Name:       name,
+		Content:    []KiroResultContent{{Text: content}},
+		Status:     status,
+		RawContent: rawContent,
+	})
+}
+
+func firstPresentField(m map[string]interface{}, keys ...string) interface{} {
+	for _, key := range keys {
+		if v, ok := m[key]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+func kiroResultContentText(v interface{}) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	case nil:
+		return ""
+	default:
+		b, err := json.Marshal(value)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
