@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -264,6 +265,33 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 
 	if strings.Contains(payload.ConversationState.CurrentMessage.UserInputMessage.Content, "Begin conversation") {
 		t.Fatalf("unexpected synthetic Begin conversation injection in current content: %q", payload.ConversationState.CurrentMessage.UserInputMessage.Content)
+	}
+}
+
+func TestClaudeToKiroExtractsDocumentTextBlock(t *testing.T) {
+	doc := base64.StdEncoding.EncodeToString([]byte("The document code is DOC-31415."))
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "Read the document and report the code."},
+				map[string]interface{}{
+					"type": "document",
+					"name": "code.txt",
+					"source": map[string]interface{}{
+						"type":       "base64",
+						"media_type": "text/plain",
+						"data":       doc,
+					},
+				},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(content, "Read the document") || !strings.Contains(content, "DOC-31415") {
+		t.Fatalf("expected document text to be included in current message, got %q", content)
 	}
 }
 

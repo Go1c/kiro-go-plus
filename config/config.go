@@ -746,6 +746,14 @@ func GetThinkingConfig() ThinkingConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 
+	if cfg == nil {
+		return ThinkingConfig{
+			Suffix:       "-thinking",
+			OpenAIFormat: "reasoning_content",
+			ClaudeFormat: "thinking",
+		}
+	}
+
 	suffix := cfg.ThinkingSuffix
 	if suffix == "" {
 		suffix = "-thinking"

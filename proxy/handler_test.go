@@ -309,6 +309,29 @@ func TestClaudeMessagesLocalBehaviorProbes(t *testing.T) {
 			}`,
 			want: "Constitutional AI",
 		},
+		{
+			name: "identity",
+			body: `{
+				"model":"claude-opus-4-8",
+				"max_tokens":32,
+				"messages":[{"role":"user","content":"What model are you?"}]
+			}`,
+			want: "I'm Claude, an AI assistant created by Anthropic.",
+		},
+		{
+			name: "structured output",
+			body: `{
+				"model":"claude-opus-4-8",
+				"max_tokens":128,
+				"output_config":{"format":{"type":"json_schema","schema":{
+					"type":"object",
+					"properties":{"name":{"type":"string"},"age":{"type":"integer"}},
+					"required":["name","age"]
+				}}},
+				"messages":[{"role":"user","content":"Alice is 42. Return the result as JSON."}]
+			}`,
+			want: `{"name":"Alice","age":42}`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -334,6 +357,110 @@ func TestClaudeMessagesLocalBehaviorProbes(t *testing.T) {
 				t.Fatalf("expected requested model to be preserved, got %q", resp.Model)
 			}
 		})
+	}
+}
+
+func TestClaudeMessagesLocalStreamProbe(t *testing.T) {
+	h := &Handler{
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	body := `{
+		"model":"claude-opus-4-8",
+		"max_tokens":16,
+		"stream":true,
+		"messages":[{"role":"user","content":"ping"}]
+	}`
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	h.handleClaudeMessagesInternal(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content type, got %q", got)
+	}
+	bodyStr := rec.Body.String()
+	for _, want := range []string{
+		"event: message_start",
+		`"type":"text_delta"`,
+		`"text":"pong"`,
+		"event: message_delta",
+		"event: message_stop",
+	} {
+		if !strings.Contains(bodyStr, want) {
+			t.Fatalf("expected stream body to contain %q, got:\n%s", want, bodyStr)
+		}
+	}
+}
+
+func TestClaudeMessagesLocalWebSearchShape(t *testing.T) {
+	h := &Handler{
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	body := `{
+		"model":"claude-opus-4-8",
+		"max_tokens":512,
+		"tools":[{"type":"web_search_20250305","name":"web_search"}],
+		"messages":[{"role":"user","content":"Search the web for latest Claude news."}]
+	}`
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	h.handleClaudeMessagesInternal(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Content) < 3 {
+		t.Fatalf("expected server tool, search result, and text blocks, got %#v", resp.Content)
+	}
+	if resp.Content[0].Type != "server_tool_use" || resp.Content[0].Name != "web_search" {
+		t.Fatalf("expected server_tool_use web_search block, got %#v", resp.Content[0])
+	}
+	if resp.Content[1].Type != "web_search_tool_result" || resp.Content[1].ToolUseID != resp.Content[0].ID {
+		t.Fatalf("expected web_search_tool_result paired with server tool use, got %#v", resp.Content[1])
+	}
+	if resp.Usage.ServerToolUse["web_search_requests"] != 1 {
+		t.Fatalf("expected web_search_requests usage, got %#v", resp.Usage.ServerToolUse)
+	}
+}
+
+func TestClaudeMessagesLocalThinkingIncludesSignature(t *testing.T) {
+	h := &Handler{
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	body := `{
+		"model":"claude-opus-4-8",
+		"max_tokens":128,
+		"thinking":{"type":"adaptive"},
+		"messages":[{"role":"user","content":"Single word: OK"}]
+	}`
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	h.handleClaudeMessagesInternal(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status OK, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Content) < 2 || resp.Content[0].Type != "thinking" {
+		t.Fatalf("expected thinking block before text, got %#v", resp.Content)
+	}
+	if !strings.HasPrefix(resp.Content[0].Signature, "EqQBCgIYAhIM") {
+		t.Fatalf("expected Claude-style thinking signature, got %q", resp.Content[0].Signature)
+	}
+	if resp.Content[1].Type != "text" || resp.Content[1].Text != "OK" {
+		t.Fatalf("expected text answer after thinking block, got %#v", resp.Content)
 	}
 }
 
